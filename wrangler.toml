@@ -6,7 +6,7 @@ compatibility_flags = ["nodejs_compat"]
 # KV namespace for storing disabled keys
 [[kv_namespaces]]
 binding = "KEY_STATUS"
-id = "YOUR_KV_NAMESPACE_ID"
+id = "e380f831eae341cbb9177adf2df8f032"
 
 # For production, use wrangler secret:
 # npx wrangler secret put VERCEL_AI_GATEWAY_KEYS
