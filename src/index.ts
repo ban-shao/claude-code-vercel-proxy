@@ -1,4 +1,4 @@
-import { gateway } from '@ai-sdk/gateway';
+import { createGateway } from '@ai-sdk/gateway';
 import type { AnthropicProviderOptions } from '@ai-sdk/anthropic';
 import { generateText, streamText, CoreMessage } from 'ai';
 import { z } from 'zod';
@@ -91,11 +91,14 @@ async function handleMessages(body: AnthropicRequest, env: Env): Promise<Respons
     providerOptions.anthropic = anthropicOptions satisfies AnthropicProviderOptions;
   }
 
-  // Create gateway model with API key
-  // The gateway() function directly returns a model that can be used with generateText/streamText
-  const model = gateway(modelId, {
+  // Create gateway instance with API key using createGateway
+  // This is the correct way to configure authentication
+  const gateway = createGateway({
     apiKey: env.VERCEL_AI_GATEWAY_KEY,
   });
+
+  // Get model from gateway
+  const model = gateway(modelId);
 
   // Build common options
   const commonOptions: any = {
