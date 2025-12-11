@@ -15,7 +15,7 @@
  */
 
 import { createGateway } from '@ai-sdk/gateway';
-import { streamText, generateText, type CoreMessage, type CoreTool } from 'ai';
+import { streamText, generateText, jsonSchema, type CoreMessage, type CoreTool } from 'ai';
 import type {
   Env,
   AnthropicRequest,
@@ -249,6 +249,39 @@ function convertSystemToMessages(
 // ============================================================================
 
 /**
+ * Recursively clean JSON Schema to remove undefined values and ensure compatibility
+ * This is critical for AWS Bedrock which is strict about schema format
+ */
+function cleanJsonSchema(schema: any): any {
+  if (schema === null || schema === undefined) {
+    return undefined;
+  }
+
+  if (Array.isArray(schema)) {
+    return schema.map(item => cleanJsonSchema(item)).filter(item => item !== undefined);
+  }
+
+  if (typeof schema === 'object') {
+    const cleaned: any = {};
+    for (const [key, value] of Object.entries(schema)) {
+      // Skip undefined values
+      if (value === undefined) continue;
+      
+      // Skip $schema field as it's not needed and can cause issues
+      if (key === '$schema') continue;
+      
+      const cleanedValue = cleanJsonSchema(value);
+      if (cleanedValue !== undefined) {
+        cleaned[key] = cleanedValue;
+      }
+    }
+    return Object.keys(cleaned).length > 0 ? cleaned : undefined;
+  }
+
+  return schema;
+}
+
+/**
  * Normalize tool input schema to ensure it has required fields
  * The schema must have type: "object" for the API to accept it
  */
@@ -262,15 +295,35 @@ function normalizeInputSchema(inputSchema: any): any {
     };
   }
 
-  // Clone the schema to avoid mutation
-  const schema = JSON.parse(JSON.stringify(inputSchema));
+  // Clone and clean the schema
+  const schema = cleanJsonSchema(JSON.parse(JSON.stringify(inputSchema)));
 
-  // Ensure type is "object" (must be exactly the string "object")
+  // Ensure type is exactly the string "object"
+  if (!schema || typeof schema !== 'object') {
+    return {
+      type: 'object',
+      properties: {},
+      required: [],
+    };
+  }
+
+  // Force type to be "object" string
   schema.type = 'object';
 
-  // Ensure properties exists
-  if (!schema.properties) {
+  // Ensure properties exists and is an object
+  if (!schema.properties || typeof schema.properties !== 'object') {
     schema.properties = {};
+  }
+
+  // Clean up each property to ensure valid types
+  for (const [propName, propValue] of Object.entries(schema.properties)) {
+    if (propValue && typeof propValue === 'object') {
+      const prop = propValue as any;
+      // Ensure each property has a valid type
+      if (!prop.type) {
+        prop.type = 'string';
+      }
+    }
   }
 
   // Ensure required is an array
@@ -278,12 +331,21 @@ function normalizeInputSchema(inputSchema: any): any {
     schema.required = [];
   }
 
+  // Remove additionalProperties if it's undefined or could cause issues
+  if (schema.additionalProperties === undefined) {
+    delete schema.additionalProperties;
+  }
+
   return schema;
 }
 
 /**
  * Convert Anthropic tools to AI SDK format
- * Uses Zod-compatible schema format for better compatibility with AI Gateway
+ * Uses jsonSchema() helper for proper compatibility with AI Gateway/Bedrock
+ * 
+ * AI SDK v5 requires:
+ * - inputSchema (not parameters) for tool definitions
+ * - jsonSchema() wrapper for JSON Schema objects
  */
 function convertTools(
   tools: AnthropicTool[] | undefined
@@ -296,20 +358,28 @@ function convertTools(
     // Normalize the input schema to ensure it has type: "object"
     const normalizedSchema = normalizeInputSchema(tool.input_schema);
     
-    // Create tool definition with JSON Schema directly
-    // AI SDK should handle the conversion internally
-    const toolDef: any = {
-      description: tool.description || '',
-      parameters: {
-        type: 'object',
-        properties: normalizedSchema.properties || {},
-        required: normalizedSchema.required || [],
-        additionalProperties: normalizedSchema.additionalProperties,
-      },
+    // Create the JSON Schema object with explicit type
+    const schemaObject = {
+      type: 'object' as const,
+      properties: normalizedSchema.properties || {},
+      required: normalizedSchema.required || [],
     };
 
+    // Add additionalProperties only if explicitly defined
+    if (normalizedSchema.additionalProperties !== undefined) {
+      (schemaObject as any).additionalProperties = normalizedSchema.additionalProperties;
+    }
+    
+    // Create tool definition using jsonSchema() helper
+    // This is the key fix - AI SDK v5 requires jsonSchema() wrapper
+    const toolDef: CoreTool = {
+      description: tool.description || '',
+      parameters: jsonSchema(schemaObject),
+    };
+
+    // Add provider options for cache control if present
     if (tool.cache_control) {
-      toolDef.providerOptions = {
+      (toolDef as any).providerOptions = {
         anthropic: { cacheControl: tool.cache_control },
       };
     }
@@ -821,7 +891,7 @@ export default {
       return jsonResponse({
         status: 'ok',
         service: 'claude-code-vercel-proxy',
-        version: '2.0.5',
+        version: '2.1.0',
         timestamp: new Date().toISOString(),
       });
     }
