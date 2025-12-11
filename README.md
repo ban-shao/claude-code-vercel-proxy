@@ -67,7 +67,7 @@ curl https://your-worker.workers.dev/v1/messages \
   -H "x-api-key: any" \
   -H "anthropic-version: 2023-06-01" \
   -d '{
-    "model": "claude-sonnet-4-20250514",
+    "model": "claude-sonnet-4-5-20250929",
     "max_tokens": 1024,
     "messages": [{"role": "user", "content": "Hello!"}]
   }'
@@ -81,7 +81,7 @@ curl https://your-worker.workers.dev/v1/messages \
   -H "x-api-key: any" \
   -H "anthropic-version: 2023-06-01" \
   -d '{
-    "model": "claude-sonnet-4-20250514",
+    "model": "claude-sonnet-4-5-20250929",
     "max_tokens": 16000,
     "thinking": {
       "type": "enabled",
@@ -133,14 +133,75 @@ curl https://your-worker.workers.dev/health
 
 ## 📋 支持的模型
 
+### 🆕 最新模型（推荐）
+
+| 模型 | API Model ID | 说明 |
+|------|-------------|------|
+| Claude Sonnet 4.5 | `claude-sonnet-4-5-20250929` | 🌟 最智能，适合复杂编码和代理任务 |
+| Claude Haiku 4.5 | `claude-haiku-4-5-20251001` | ⚡ 最快速，适合简单任务 |
+| Claude Opus 4.5 | `claude-opus-4-5-20251101` | 🧠 最强大旗舰模型 |
+| Claude Opus 4.1 | `claude-opus-4-1-20250805` | 专业推理任务 |
+
+### Claude 4 系列
+
 | 模型 | API Model ID |
 |------|-------------|
-| Claude Opus 4.5 | `claude-opus-4-5-20251101` |
 | Claude Opus 4 | `claude-opus-4-20250514` |
 | Claude Sonnet 4 | `claude-sonnet-4-20250514` |
+
+### 旧版模型
+
+| 模型 | API Model ID |
+|------|-------------|
 | Claude 3.7 Sonnet | `claude-3-7-sonnet-20250219` |
 | Claude 3.5 Sonnet | `claude-3-5-sonnet-20241022` |
 | Claude 3.5 Haiku | `claude-3-5-haiku-20241022` |
+
+> 💡 **提示**：Claude Code 支持模型别名，可在启动时使用 `claude --model sonnet`、`claude --model opus`、`claude --model haiku` 等简写。
+
+## 🖥️ Claude Code 配置
+
+### 方法一：设置环境变量
+
+```bash
+# 设置代理地址
+export ANTHROPIC_BASE_URL="https://your-worker.workers.dev"
+
+# API Key 可以随意填（代理会用自己的 Key）
+export ANTHROPIC_API_KEY="any"
+
+# 启动 Claude Code
+claude
+```
+
+### 方法二：永久配置
+
+在 `~/.bashrc` 或 `~/.zshrc` 中添加：
+
+```bash
+# Claude Code Vercel Proxy 配置
+export ANTHROPIC_BASE_URL="https://your-worker.workers.dev"
+export ANTHROPIC_API_KEY="any"
+```
+
+然后重新加载配置：
+
+```bash
+source ~/.bashrc  # 或 source ~/.zshrc
+```
+
+### 方法三：启动时指定模型
+
+```bash
+# 使用 Sonnet 模型
+claude --model sonnet
+
+# 使用 Opus 模型
+claude --model opus
+
+# 使用混合模式（规划用 Opus，执行用 Sonnet）
+claude --model opusplan
+```
 
 ## 📄 License
 
