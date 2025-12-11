@@ -1,75 +1,73 @@
 # Claude Code Vercel Proxy
 
-一个运行在 Cloudflare Workers 上的代理服务，将 Anthropic API 请求转发到 Vercel AI Gateway。
+A Cloudflare Worker that proxies Anthropic Claude API requests through Vercel AI Gateway.
 
-## ✨ 特性
+## Features
 
-- 🔄 **多 Key 负载均衡** - 支持多个 Vercel AI Gateway Key，自动轮询
-- 💰 **额度耗尽自动切换** - Key 额度用完自动切换到下一个
-- 📅 **每月自动重置** - 每月15日自动重置被禁用的 Key
-- 🧠 **Extended Thinking** - 完整支持 Claude 的深度思考功能
-- 🛠 **工具调用** - 支持 tool_use 和 tool_result
-- 📄 **多模态输入** - 支持图片和 PDF 文档
-- 💾 **缓存控制** - 支持 Anthropic 的 cache_control 功能
-- 🌊 **流式输出** - 完整的 SSE 流式响应支持
+- ✅ **All Claude Models** - Support for Claude 4, Opus 4.5, Sonnet 4, and all previous versions
+- ✅ **Extended Thinking** - Full support for Claude's thinking/reasoning capability
+- ✅ **Streaming** - Real-time streaming responses with SSE
+- ✅ **Tool Calling** - Complete tool/function calling support
+- ✅ **Vision** - Image input support (base64)
+- ✅ **PDF Documents** - PDF file input support
+- ✅ **Cache Control** - Prompt caching for cost optimization
+- ✅ **Full API Compatibility** - 100% compatible with Anthropic API format
 
-## 🚀 部署指南
+## Supported Models
 
-### 1. 创建 KV 命名空间
+| Model | API ID |
+|-------|--------|
+| Claude Opus 4.5 | `claude-opus-4-5-20251101` |
+| Claude Opus 4 | `claude-opus-4-20250514` |
+| Claude Sonnet 4 | `claude-sonnet-4-20250514` |
+| Claude 3.7 Sonnet | `claude-3-7-sonnet-20250219` |
+| Claude 3.5 Sonnet | `claude-3-5-sonnet-20241022` |
+| Claude 3.5 Haiku | `claude-3-5-haiku-20241022` |
+| Claude 3 Opus | `claude-3-opus-20240229` |
+| Claude 3 Sonnet | `claude-3-sonnet-20240229` |
+| Claude 3 Haiku | `claude-3-haiku-20240307` |
 
-```bash
-# 创建 KV 命名空间用于存储 Key 状态
-npx wrangler kv:namespace create KEY_STATUS
-```
+## Quick Start
 
-这会输出类似：
-```
-🌀 Creating namespace with title "claude-code-vercel-proxy-KEY_STATUS"
-✨ Success!
-Add the following to your configuration file in your kv_namespaces array:
-[[kv_namespaces]]
-binding = "KEY_STATUS"
-id = "xxxxxxxxxxxxxxxxxxxx"
-```
-
-### 2. 更新 wrangler.toml
-
-将上面输出的 `id` 替换到 `wrangler.toml` 中：
-
-```toml
-[[kv_namespaces]]
-binding = "KEY_STATUS"
-id = "你的实际KV命名空间ID"
-```
-
-### 3. 配置 API Keys
+### 1. Clone and Install
 
 ```bash
-# 添加多个 Key（用逗号分隔）
-npx wrangler secret put VERCEL_AI_GATEWAY_KEYS
-# 输入: key1,key2,key3,key4
-```
-
-### 4. 部署
-
-```bash
+git clone https://github.com/ban-shao/claude-code-vercel-proxy.git
+cd claude-code-vercel-proxy
 npm install
+```
+
+### 2. Configure Secrets
+
+```bash
+# Set your Vercel AI Gateway API key
+npx wrangler secret put VERCEL_AI_GATEWAY_KEY
+
+# Optional: Set a custom API key for your proxy
+npx wrangler secret put PROXY_API_KEY
+```
+
+### 3. Deploy
+
+```bash
 npm run deploy
 ```
 
-## 📖 使用方式
+## Usage Examples
 
-### 基本请求
+### Basic Request
 
 ```bash
 curl https://your-worker.workers.dev/v1/messages \
   -H "Content-Type: application/json" \
-  -H "x-api-key: any" \
+  -H "x-api-key: your-proxy-key" \
   -H "anthropic-version: 2023-06-01" \
   -d '{
-    "model": "claude-sonnet-4-5-20250929",
+    "model": "claude-sonnet-4-20250514",
     "max_tokens": 1024,
-    "messages": [{"role": "user", "content": "Hello!"}]
+    "messages": [
+      {"role": "user", "content": "Hello, Claude!"}
+    ]
   }'
 ```
 
@@ -78,131 +76,149 @@ curl https://your-worker.workers.dev/v1/messages \
 ```bash
 curl https://your-worker.workers.dev/v1/messages \
   -H "Content-Type: application/json" \
-  -H "x-api-key: any" \
+  -H "x-api-key: your-proxy-key" \
   -H "anthropic-version: 2023-06-01" \
   -d '{
-    "model": "claude-sonnet-4-5-20250929",
+    "model": "claude-sonnet-4-20250514",
     "max_tokens": 16000,
     "thinking": {
       "type": "enabled",
       "budget_tokens": 10000
     },
-    "messages": [{"role": "user", "content": "Solve this complex problem..."}]
+    "messages": [
+      {"role": "user", "content": "Solve this step by step: What is 15 * 37?"}
+    ]
   }'
 ```
 
-### 健康检查（查看 Key 状态）
+### Streaming
 
 ```bash
-curl https://your-worker.workers.dev/health
+curl https://your-worker.workers.dev/v1/messages \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: your-proxy-key" \
+  -H "anthropic-version: 2023-06-01" \
+  -d '{
+    "model": "claude-sonnet-4-20250514",
+    "max_tokens": 1024,
+    "stream": true,
+    "messages": [
+      {"role": "user", "content": "Write a short poem about coding."}
+    ]
+  }'
 ```
 
-返回：
-```json
-{
-  "status": "ok",
-  "message": "Claude Code Vercel Proxy is running",
-  "keys": {
-    "total": 5,
-    "available": 3,
-    "disabled": 2
-  },
-  "nextReset": "2025-02-15T00:00:00.000Z"
-}
-```
-
-## 🔧 Key 管理机制
-
-### 负载均衡
-
-- 多个 Key 按顺序轮询使用
-- 每次请求自动选择下一个可用的 Key
-
-### 额度耗尽检测
-
-当检测到以下错误时，Key 会被自动禁用：
-- `quota` / `insufficient` / `exceeded`
-- `billing` / `payment required`
-- `credit` / `balance`
-- `usage limit` / `spending limit`
-
-### 自动重置
-
-- 每月 **15日凌晨 (UTC)** 自动重置所有被禁用的 Key
-- 这与 Vercel 免费额度的月度重置周期对应
-
-## 📋 支持的模型
-
-### 🆕 最新模型（推荐）
-
-| 模型 | API Model ID | 说明 |
-|------|-------------|------|
-| Claude Sonnet 4.5 | `claude-sonnet-4-5-20250929` | 🌟 最智能，适合复杂编码和代理任务 |
-| Claude Haiku 4.5 | `claude-haiku-4-5-20251001` | ⚡ 最快速，适合简单任务 |
-| Claude Opus 4.5 | `claude-opus-4-5-20251101` | 🧠 最强大旗舰模型 |
-| Claude Opus 4.1 | `claude-opus-4-1-20250805` | 专业推理任务 |
-
-### Claude 4 系列
-
-| 模型 | API Model ID |
-|------|-------------|
-| Claude Opus 4 | `claude-opus-4-20250514` |
-| Claude Sonnet 4 | `claude-sonnet-4-20250514` |
-
-### 旧版模型
-
-| 模型 | API Model ID |
-|------|-------------|
-| Claude 3.7 Sonnet | `claude-3-7-sonnet-20250219` |
-| Claude 3.5 Sonnet | `claude-3-5-sonnet-20241022` |
-| Claude 3.5 Haiku | `claude-3-5-haiku-20241022` |
-
-> 💡 **提示**：Claude Code 支持模型别名，可在启动时使用 `claude --model sonnet`、`claude --model opus`、`claude --model haiku` 等简写。
-
-## 🖥️ Claude Code 配置
-
-### 方法一：设置环境变量
+### Tool Calling
 
 ```bash
-# 设置代理地址
-export ANTHROPIC_BASE_URL="https://your-worker.workers.dev"
-
-# API Key 可以随意填（代理会用自己的 Key）
-export ANTHROPIC_API_KEY="any"
-
-# 启动 Claude Code
-claude
+curl https://your-worker.workers.dev/v1/messages \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: your-proxy-key" \
+  -H "anthropic-version: 2023-06-01" \
+  -d '{
+    "model": "claude-sonnet-4-20250514",
+    "max_tokens": 1024,
+    "tools": [
+      {
+        "name": "get_weather",
+        "description": "Get the current weather for a location",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "location": {
+              "type": "string",
+              "description": "City name"
+            }
+          },
+          "required": ["location"]
+        }
+      }
+    ],
+    "messages": [
+      {"role": "user", "content": "What is the weather in Tokyo?"}
+    ]
+  }'
 ```
 
-### 方法二：永久配置
-
-在 `~/.bashrc` 或 `~/.zshrc` 中添加：
+### Image Input
 
 ```bash
-# Claude Code Vercel Proxy 配置
-export ANTHROPIC_BASE_URL="https://your-worker.workers.dev"
-export ANTHROPIC_API_KEY="any"
+curl https://your-worker.workers.dev/v1/messages \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: your-proxy-key" \
+  -H "anthropic-version: 2023-06-01" \
+  -d '{
+    "model": "claude-sonnet-4-20250514",
+    "max_tokens": 1024,
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "image",
+            "source": {
+              "type": "base64",
+              "media_type": "image/png",
+              "data": "<base64-encoded-image>"
+            }
+          },
+          {
+            "type": "text",
+            "text": "What is in this image?"
+          }
+        ]
+      }
+    ]
+  }'
 ```
 
-然后重新加载配置：
+### Cache Control
 
 ```bash
-source ~/.bashrc  # 或 source ~/.zshrc
+curl https://your-worker.workers.dev/v1/messages \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: your-proxy-key" \
+  -H "anthropic-version: 2023-06-01" \
+  -d '{
+    "model": "claude-sonnet-4-20250514",
+    "max_tokens": 1024,
+    "system": [
+      {
+        "type": "text",
+        "text": "You are a helpful assistant with extensive knowledge.",
+        "cache_control": {"type": "ephemeral"}
+      }
+    ],
+    "messages": [
+      {"role": "user", "content": "Hello!"}
+    ]
+  }'
 ```
 
-### 方法三：启动时指定模型
+## Development
 
 ```bash
-# 使用 Sonnet 模型
-claude --model sonnet
+# Run locally
+npm run dev
 
-# 使用 Opus 模型
-claude --model opus
+# Type check
+npm run lint
 
-# 使用混合模式（规划用 Opus，执行用 Sonnet）
-claude --model opusplan
+# Deploy
+npm run deploy
 ```
 
-## 📄 License
+## Environment Variables
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `VERCEL_AI_GATEWAY_KEY` | Yes | Your Vercel AI Gateway API key |
+| `PROXY_API_KEY` | No | Optional API key to protect your proxy |
+
+## API Compatibility
+
+This proxy is fully compatible with the [Anthropic Messages API](https://docs.anthropic.com/en/api/messages). You can use it as a drop-in replacement by changing the base URL.
+
+## License
 
 MIT

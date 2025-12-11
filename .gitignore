@@ -1,18 +1,19 @@
 # Dependencies
 node_modules/
 
-# Build output
+# Build outputs
 dist/
 .wrangler/
 
 # Environment files
 .env
 .env.local
+.env.*.local
 .dev.vars
 
 # IDE
-.idea/
 .vscode/
+.idea/
 *.swp
 *.swo
 
@@ -24,5 +25,5 @@ Thumbs.db
 *.log
 npm-debug.log*
 
-# Test
-coverage/
+# Lock files (optional)
+package-lock.json
