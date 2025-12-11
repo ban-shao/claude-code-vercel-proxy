@@ -672,6 +672,12 @@ function normalizeModelId(model: string): string {
 
 // ==================== Stream Response ====================
 
+// Helper to extract text from various possible property names in stream parts
+function extractTextDelta(part: any): string {
+  // Try various possible property names
+  return part.textDelta || part.text || part.delta?.text || part.content || '';
+}
+
 async function handleStreamResponse(options: any, originalModel: string): Promise<Response> {
   const result = streamText(options);
 
@@ -683,191 +689,149 @@ async function handleStreamResponse(options: any, originalModel: string): Promis
 
   const stream = new ReadableStream({
     async start(controller) {
+      // Helper function to send SSE event
+      const sendEvent = (event: string, data: any) => {
+        controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
+      };
+
       // Send message_start
-      controller.enqueue(
-        encoder.encode(
-          `event: message_start\ndata: ${JSON.stringify({
-            type: 'message_start',
-            message: {
-              id: messageId,
-              type: 'message',
-              role: 'assistant',
-              content: [],
-              model: originalModel,
-              stop_reason: null,
-              stop_sequence: null,
-              usage: { input_tokens: 0, output_tokens: 0 },
-            },
-          })}\n\n`
-        )
-      );
+      sendEvent('message_start', {
+        type: 'message_start',
+        message: {
+          id: messageId,
+          type: 'message',
+          role: 'assistant',
+          content: [],
+          model: originalModel,
+          stop_reason: null,
+          stop_sequence: null,
+          usage: { input_tokens: 0, output_tokens: 0 },
+        },
+      });
 
       try {
         for await (const part of result.fullStream) {
+          // Debug logging (can be removed in production)
+          // console.log('Stream part:', JSON.stringify(part));
+
           switch (part.type) {
             case 'reasoning':
               if (!hasThinkingBlock) {
-                controller.enqueue(
-                  encoder.encode(
-                    `event: content_block_start\ndata: ${JSON.stringify({
-                      type: 'content_block_start',
-                      index: contentBlockIndex,
-                      content_block: { type: 'thinking', thinking: '' },
-                    })}\n\n`
-                  )
-                );
+                sendEvent('content_block_start', {
+                  type: 'content_block_start',
+                  index: contentBlockIndex,
+                  content_block: { type: 'thinking', thinking: '' },
+                });
                 hasThinkingBlock = true;
               }
-              controller.enqueue(
-                encoder.encode(
-                  `event: content_block_delta\ndata: ${JSON.stringify({
-                    type: 'content_block_delta',
-                    index: contentBlockIndex,
-                    delta: { type: 'thinking_delta', thinking: part.textDelta },
-                  })}\n\n`
-                )
-              );
+              const thinkingText = extractTextDelta(part);
+              if (thinkingText) {
+                sendEvent('content_block_delta', {
+                  type: 'content_block_delta',
+                  index: contentBlockIndex,
+                  delta: { type: 'thinking_delta', thinking: thinkingText },
+                });
+              }
               break;
 
             case 'text-delta':
               if (hasThinkingBlock && !hasStartedTextBlock) {
-                controller.enqueue(
-                  encoder.encode(
-                    `event: content_block_stop\ndata: ${JSON.stringify({
-                      type: 'content_block_stop',
-                      index: contentBlockIndex,
-                    })}\n\n`
-                  )
-                );
+                sendEvent('content_block_stop', {
+                  type: 'content_block_stop',
+                  index: contentBlockIndex,
+                });
                 contentBlockIndex++;
                 hasThinkingBlock = false;
               }
 
               if (!hasStartedTextBlock) {
-                controller.enqueue(
-                  encoder.encode(
-                    `event: content_block_start\ndata: ${JSON.stringify({
-                      type: 'content_block_start',
-                      index: contentBlockIndex,
-                      content_block: { type: 'text', text: '' },
-                    })}\n\n`
-                  )
-                );
+                sendEvent('content_block_start', {
+                  type: 'content_block_start',
+                  index: contentBlockIndex,
+                  content_block: { type: 'text', text: '' },
+                });
                 hasStartedTextBlock = true;
               }
 
-              controller.enqueue(
-                encoder.encode(
-                  `event: content_block_delta\ndata: ${JSON.stringify({
-                    type: 'content_block_delta',
-                    index: contentBlockIndex,
-                    delta: { type: 'text_delta', text: part.textDelta },
-                  })}\n\n`
-                )
-              );
+              const textContent = extractTextDelta(part);
+              if (textContent) {
+                sendEvent('content_block_delta', {
+                  type: 'content_block_delta',
+                  index: contentBlockIndex,
+                  delta: { type: 'text_delta', text: textContent },
+                });
+              }
               break;
 
             case 'tool-call':
               if (hasStartedTextBlock || hasThinkingBlock) {
-                controller.enqueue(
-                  encoder.encode(
-                    `event: content_block_stop\ndata: ${JSON.stringify({
-                      type: 'content_block_stop',
-                      index: contentBlockIndex,
-                    })}\n\n`
-                  )
-                );
+                sendEvent('content_block_stop', {
+                  type: 'content_block_stop',
+                  index: contentBlockIndex,
+                });
                 contentBlockIndex++;
                 hasStartedTextBlock = false;
                 hasThinkingBlock = false;
               }
 
-              controller.enqueue(
-                encoder.encode(
-                  `event: content_block_start\ndata: ${JSON.stringify({
-                    type: 'content_block_start',
-                    index: contentBlockIndex,
-                    content_block: {
-                      type: 'tool_use',
-                      id: part.toolCallId,
-                      name: part.toolName,
-                      input: {},
-                    },
-                  })}\n\n`
-                )
-              );
+              sendEvent('content_block_start', {
+                type: 'content_block_start',
+                index: contentBlockIndex,
+                content_block: {
+                  type: 'tool_use',
+                  id: part.toolCallId,
+                  name: part.toolName,
+                  input: {},
+                },
+              });
 
-              controller.enqueue(
-                encoder.encode(
-                  `event: content_block_delta\ndata: ${JSON.stringify({
-                    type: 'content_block_delta',
-                    index: contentBlockIndex,
-                    delta: {
-                      type: 'input_json_delta',
-                      partial_json: JSON.stringify(part.args),
-                    },
-                  })}\n\n`
-                )
-              );
+              sendEvent('content_block_delta', {
+                type: 'content_block_delta',
+                index: contentBlockIndex,
+                delta: {
+                  type: 'input_json_delta',
+                  partial_json: JSON.stringify(part.args),
+                },
+              });
 
-              controller.enqueue(
-                encoder.encode(
-                  `event: content_block_stop\ndata: ${JSON.stringify({
-                    type: 'content_block_stop',
-                    index: contentBlockIndex,
-                  })}\n\n`
-                )
-              );
+              sendEvent('content_block_stop', {
+                type: 'content_block_stop',
+                index: contentBlockIndex,
+              });
               contentBlockIndex++;
               break;
 
             case 'finish':
               if (hasStartedTextBlock || hasThinkingBlock) {
-                controller.enqueue(
-                  encoder.encode(
-                    `event: content_block_stop\ndata: ${JSON.stringify({
-                      type: 'content_block_stop',
-                      index: contentBlockIndex,
-                    })}\n\n`
-                  )
-                );
+                sendEvent('content_block_stop', {
+                  type: 'content_block_stop',
+                  index: contentBlockIndex,
+                });
               }
 
               const usage = part.usage || { promptTokens: 0, completionTokens: 0 };
 
-              controller.enqueue(
-                encoder.encode(
-                  `event: message_delta\ndata: ${JSON.stringify({
-                    type: 'message_delta',
-                    delta: {
-                      stop_reason: part.finishReason === 'tool-calls' ? 'tool_use' : 'end_turn',
-                      stop_sequence: null,
-                    },
-                    usage: { output_tokens: usage.completionTokens || 0 },
-                  })}\n\n`
-                )
-              );
+              sendEvent('message_delta', {
+                type: 'message_delta',
+                delta: {
+                  stop_reason: part.finishReason === 'tool-calls' ? 'tool_use' : 'end_turn',
+                  stop_sequence: null,
+                },
+                usage: { output_tokens: usage.completionTokens || 0 },
+              });
 
-              controller.enqueue(
-                encoder.encode(
-                  `event: message_stop\ndata: ${JSON.stringify({
-                    type: 'message_stop',
-                  })}\n\n`
-                )
-              );
+              sendEvent('message_stop', {
+                type: 'message_stop',
+              });
               break;
           }
         }
       } catch (error: any) {
         console.error('Stream error:', error);
-        controller.enqueue(
-          encoder.encode(
-            `event: error\ndata: ${JSON.stringify({
-              type: 'error',
-              error: { type: 'api_error', message: error.message },
-            })}\n\n`
-          )
-        );
+        sendEvent('error', {
+          type: 'error',
+          error: { type: 'api_error', message: error.message },
+        });
       }
 
       controller.close();
