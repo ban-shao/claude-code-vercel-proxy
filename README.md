@@ -11,6 +11,7 @@
 - ✅ **流式输出** - 实时 SSE 流式响应
 - ✅ **PDF 文档** - 文档输入支持
 - ✅ **System Prompt** - 完整的系统提示支持
+- ✅ **Cache Control** - 完整的缓存控制支持
 - ✅ **免费部署** - Cloudflare Workers 免费套餐
 
 ## 架构
@@ -21,10 +22,11 @@ Claude Code CLI          CF Worker                 Vercel AI Gateway
       │                       │                          │
       │  POST /v1/messages    │                          │
       │  {                    │                          │
-      │    thinking: {...}    │    Vercel AI SDK         │
+      │    thinking: {...}    │    @ai-sdk/anthropic     │
       │    tools: [...] ────────► providerOptions ─────────► Claude
       │    messages: [...]    │    generateText()        │
-      │  }                    │    streamText()          │
+      │    cache_control      │    streamText()          │
+      │  }                    │                          │
       │                       │                          │
       │ ◀─────────────────────│◀─────────────────────────│
       │  Anthropic SSE format │    Convert response      │
@@ -113,8 +115,8 @@ npm run dev
 | 工具调用 | `tools` + `tool_choice` | ✅ 完整 |
 | 工具结果 | `tool_result` content blocks | ✅ 完整 |
 | System Prompt | `system` | ✅ 完整 |
-| PDF 文档 | `document` content blocks | ✅ 基础 |
-| 缓存控制 | `cache_control` | ⚠️ 部分 |
+| PDF 文档 | `document` content blocks | ✅ 完整 |
+| 缓存控制 | `cache_control` | ✅ 完整 |
 
 ## 工作原理
 
@@ -148,6 +150,36 @@ npm run dev
 }
 ```
 
+### 关键转换：Cache Control
+
+```typescript
+// Claude Code 发送的格式 (Anthropic)
+{
+  "system": [
+    {
+      "type": "text",
+      "text": "You are a helpful assistant.",
+      "cache_control": { "type": "ephemeral" }
+    }
+  ]
+}
+
+// 转换为 Vercel AI SDK 格式
+{
+  system: [
+    {
+      type: 'text',
+      text: 'You are a helpful assistant.',
+      providerOptions: {
+        anthropic: {
+          cacheControl: { type: 'ephemeral' }
+        }
+      }
+    }
+  ]
+}
+```
+
 ## 故障排除
 
 ### "thinking requires a budget" 错误
@@ -172,6 +204,21 @@ npm run dev
 
 1. 验证你的 Vercel AI Gateway key 是否有效
 2. 重新运行 `npx wrangler secret put VERCEL_AI_GATEWAY_KEY`
+
+### 缓存不工作
+
+确保在消息内容块上正确设置了 `cache_control`：
+```json
+{
+  "content": [
+    {
+      "type": "text",
+      "text": "Large content to cache...",
+      "cache_control": { "type": "ephemeral" }
+    }
+  ]
+}
+```
 
 ## 费用
 

@@ -1,4 +1,4 @@
-import { createGateway } from '@ai-sdk/gateway';
+import { createAnthropic } from '@ai-sdk/anthropic';
 import { generateText, streamText, CoreMessage } from 'ai';
 import { z } from 'zod';
 import type {
@@ -65,27 +65,23 @@ export default {
 // ==================== Main Handler ====================
 
 async function handleMessages(body: AnthropicRequest, env: Env): Promise<Response> {
-  // Initialize Gateway provider for Vercel AI Gateway
-  const gateway = createGateway({
+  // Initialize Anthropic provider with Vercel AI Gateway
+  const anthropic = createAnthropic({
     apiKey: env.VERCEL_AI_GATEWAY_KEY,
+    baseURL: 'https://ai-gateway.vercel.sh/v1/anthropic',
   });
 
-  // Build model ID with anthropic prefix for Vercel AI Gateway
-  const modelId = `anthropic/${normalizeModelId(body.model)}`;
+  // Normalize model ID
+  const modelId = normalizeModelId(body.model);
 
   // Convert messages from Anthropic format to AI SDK format (with cache control)
   const messages = convertMessagesToAISDK(body.messages);
 
   // Handle system prompt (with cache control support)
-  const systemMessages = buildSystemMessages(body.system);
-  if (systemMessages.length > 0) {
-    messages.unshift(...systemMessages);
-  }
+  const systemContent = buildSystemContent(body.system);
 
   // Build provider options for Anthropic
   const providerOptions: Record<string, any> = {};
-
-  // Configure Anthropic-specific options
   const anthropicOptions: Record<string, any> = {};
 
   // Extended Thinking support
@@ -102,13 +98,18 @@ async function handleMessages(body: AnthropicRequest, env: Env): Promise<Respons
 
   // Build common options
   const commonOptions: any = {
-    model: gateway(modelId),
+    model: anthropic(modelId),
     messages,
     maxTokens: body.max_tokens,
     temperature: body.temperature,
     topP: body.top_p,
     stopSequences: body.stop_sequences,
   };
+
+  // Add system content if present
+  if (systemContent) {
+    commonOptions.system = systemContent;
+  }
 
   // Add provider options if any
   if (Object.keys(providerOptions).length > 0) {
@@ -237,37 +238,33 @@ function convertMessagesToAISDK(messages: AnthropicMessage[]): CoreMessage[] {
   return result;
 }
 
-function buildSystemMessages(
+function buildSystemContent(
   system: string | Array<{ type: string; text: string; cache_control?: { type: string } }> | undefined
-): CoreMessage[] {
-  if (!system) return [];
+): string | Array<any> | undefined {
+  if (!system) return undefined;
 
   if (typeof system === 'string') {
-    return [{ role: 'system', content: system }];
+    return system;
   }
 
   // Handle array of system content blocks with cache control
-  const systemMessages: CoreMessage[] = [];
-
-  for (const block of system) {
-    const message: any = {
-      role: 'system',
-      content: block.text,
+  return system.map((block) => {
+    const content: any = {
+      type: 'text',
+      text: block.text,
     };
 
     // Add cache control if present
     if (block.cache_control) {
-      message.providerOptions = {
+      content.providerOptions = {
         anthropic: {
           cacheControl: block.cache_control,
         },
       };
     }
 
-    systemMessages.push(message);
-  }
-
-  return systemMessages;
+    return content;
+  });
 }
 
 // ==================== Tool Conversion ====================
@@ -366,6 +363,7 @@ async function handleStreamResponse(options: any, originalModel: string): Promis
   const encoder = new TextEncoder();
   const messageId = `msg_${Date.now()}`;
   let contentBlockIndex = 0;
+  let hasStartedTextBlock = false;
   let hasThinkingBlock = false;
 
   const stream = new ReadableStream({
@@ -390,11 +388,8 @@ async function handleStreamResponse(options: any, originalModel: string): Promis
       );
 
       try {
-        // Check if we have reasoning/thinking in the result
-        const resultPromise = result;
-
-        // Process the stream
-        for await (const part of resultPromise.fullStream) {
+        // Process the stream using fullStream
+        for await (const part of result.fullStream) {
           switch (part.type) {
             case 'reasoning':
               // Handle reasoning/thinking blocks
@@ -424,7 +419,7 @@ async function handleStreamResponse(options: any, originalModel: string): Promis
 
             case 'text-delta':
               // If we were in thinking mode, close it first
-              if (hasThinkingBlock) {
+              if (hasThinkingBlock && !hasStartedTextBlock) {
                 controller.enqueue(
                   encoder.encode(
                     `event: content_block_stop\ndata: ${JSON.stringify({
@@ -435,8 +430,10 @@ async function handleStreamResponse(options: any, originalModel: string): Promis
                 );
                 contentBlockIndex++;
                 hasThinkingBlock = false;
+              }
 
-                // Start text block
+              // Start text block if not started
+              if (!hasStartedTextBlock) {
                 controller.enqueue(
                   encoder.encode(
                     `event: content_block_start\ndata: ${JSON.stringify({
@@ -446,17 +443,7 @@ async function handleStreamResponse(options: any, originalModel: string): Promis
                     })}\n\n`
                   )
                 );
-              } else if (contentBlockIndex === 0) {
-                // First text block
-                controller.enqueue(
-                  encoder.encode(
-                    `event: content_block_start\ndata: ${JSON.stringify({
-                      type: 'content_block_start',
-                      index: contentBlockIndex,
-                      content_block: { type: 'text', text: '' },
-                    })}\n\n`
-                  )
-                );
+                hasStartedTextBlock = true;
               }
 
               controller.enqueue(
@@ -471,8 +458,8 @@ async function handleStreamResponse(options: any, originalModel: string): Promis
               break;
 
             case 'tool-call':
-              // Close any open block
-              if (contentBlockIndex >= 0) {
+              // Close any open block first
+              if (hasStartedTextBlock || hasThinkingBlock) {
                 controller.enqueue(
                   encoder.encode(
                     `event: content_block_stop\ndata: ${JSON.stringify({
@@ -481,8 +468,10 @@ async function handleStreamResponse(options: any, originalModel: string): Promis
                     })}\n\n`
                   )
                 );
+                contentBlockIndex++;
+                hasStartedTextBlock = false;
+                hasThinkingBlock = false;
               }
-              contentBlockIndex++;
 
               // Start tool use block
               controller.enqueue(
@@ -521,18 +510,21 @@ async function handleStreamResponse(options: any, originalModel: string): Promis
                   })}\n\n`
                 )
               );
+              contentBlockIndex++;
               break;
 
             case 'finish':
               // Close any open block
-              controller.enqueue(
-                encoder.encode(
-                  `event: content_block_stop\ndata: ${JSON.stringify({
-                    type: 'content_block_stop',
-                    index: contentBlockIndex,
-                  })}\n\n`
-                )
-              );
+              if (hasStartedTextBlock || hasThinkingBlock) {
+                controller.enqueue(
+                  encoder.encode(
+                    `event: content_block_stop\ndata: ${JSON.stringify({
+                      type: 'content_block_stop',
+                      index: contentBlockIndex,
+                    })}\n\n`
+                  )
+                );
+              }
 
               // Get usage from finish event
               const usage = part.usage || { promptTokens: 0, completionTokens: 0 };
@@ -596,19 +588,12 @@ async function handleNonStreamResponse(options: any, originalModel: string): Pro
   // Build Anthropic format response
   const content: ContentBlock[] = [];
 
-  // Add thinking if present (from reasoning)
-  if (result.reasoning) {
+  // Add thinking if present (check multiple possible properties)
+  const thinkingContent = (result as any).reasoning || (result as any).reasoningText;
+  if (thinkingContent) {
     content.push({
       type: 'thinking',
-      thinking: result.reasoning,
-    });
-  }
-
-  // Also check reasoningText
-  if (result.reasoningText) {
-    content.push({
-      type: 'thinking',
-      thinking: result.reasoningText,
+      thinking: thinkingContent,
     });
   }
 
@@ -648,7 +633,7 @@ async function handleNonStreamResponse(options: any, originalModel: string): Pro
   };
 
   // Add cache usage if available from provider metadata
-  const anthropicMetadata = result.providerMetadata?.anthropic as any;
+  const anthropicMetadata = (result as any).providerMetadata?.anthropic;
   if (anthropicMetadata) {
     if (anthropicMetadata.cacheCreationInputTokens !== undefined) {
       response.usage.cache_creation_input_tokens = anthropicMetadata.cacheCreationInputTokens;

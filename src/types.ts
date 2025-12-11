@@ -25,7 +25,7 @@ export interface AnthropicMessage {
 
 export interface CacheControl {
   type: 'ephemeral';
-  ttl?: string; // e.g., '1h' for 1 hour
+  ttl?: string;
 }
 
 export interface ContentBlock {
