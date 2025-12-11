@@ -249,6 +249,41 @@ function convertSystemToMessages(
 // ============================================================================
 
 /**
+ * Normalize tool input schema to ensure it has required fields
+ * The schema must have type: "object" for the API to accept it
+ */
+function normalizeInputSchema(inputSchema: any): any {
+  // If no schema provided, return a minimal valid schema
+  if (!inputSchema) {
+    return {
+      type: 'object',
+      properties: {},
+      required: [],
+    };
+  }
+
+  // If schema doesn't have type, add it
+  if (!inputSchema.type) {
+    return {
+      type: 'object',
+      ...inputSchema,
+    };
+  }
+
+  // If schema type is not object, wrap it
+  if (inputSchema.type !== 'object') {
+    return {
+      type: 'object',
+      properties: inputSchema.properties || {},
+      required: inputSchema.required || [],
+    };
+  }
+
+  // Schema is valid, return as-is
+  return inputSchema;
+}
+
+/**
  * Convert Anthropic tools to AI SDK format
  */
 function convertTools(
@@ -259,9 +294,12 @@ function convertTools(
   const result: Record<string, CoreTool> = {};
 
   for (const tool of tools) {
+    // Normalize the input schema to ensure it has type: "object"
+    const normalizedSchema = normalizeInputSchema(tool.input_schema);
+    
     const toolDef: any = {
-      description: tool.description,
-      parameters: tool.input_schema,
+      description: tool.description || '',
+      parameters: normalizedSchema,
     };
 
     if (tool.cache_control) {
@@ -784,7 +822,7 @@ export default {
       return jsonResponse({
         status: 'ok',
         service: 'claude-code-vercel-proxy',
-        version: '2.0.2',
+        version: '2.0.3',
         timestamp: new Date().toISOString(),
       });
     }
