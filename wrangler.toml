@@ -3,11 +3,5 @@ main = "src/index.ts"
 compatibility_date = "2024-12-01"
 compatibility_flags = ["nodejs_compat"]
 
-# KV namespace for storing disabled keys
-[[kv_namespaces]]
-binding = "KEY_STATUS"
-id = "e380f831eae341cbb9177adf2df8f032"
-
 # For production, use wrangler secret:
-# npx wrangler secret put VERCEL_AI_GATEWAY_KEYS
-# (Multiple keys separated by commas)
+# npx wrangler secret put VERCEL_AI_GATEWAY_KEY

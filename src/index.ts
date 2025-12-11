@@ -8,207 +8,7 @@ import type {
   ContentBlock,
   AnthropicTool,
   Env,
-  KeyStatus,
 } from './types';
-
-// ==================== Key Management ====================
-
-// Disabled keys cache (populated only when we encounter quota errors)
-// This is a lightweight in-memory set that persists within a single Worker instance
-const disabledKeysCache = new Set<string>();
-
-class KeyManager {
-  private keys: string[];
-  private currentIndex: number = 0;
-  private env: Env;
-
-  constructor(env: Env) {
-    this.env = env;
-    // Support both new multi-key and legacy single key
-    const keysString = env.VERCEL_AI_GATEWAY_KEYS || env.VERCEL_AI_GATEWAY_KEY || '';
-    this.keys = keysString
-      .split(',')
-      .map((k) => k.trim())
-      .filter((k) => k.length > 0);
-
-    if (this.keys.length === 0) {
-      throw new Error('No API keys configured');
-    }
-
-    console.log(`Loaded ${this.keys.length} API key(s)`);
-  }
-
-  // Get KV key for storing status
-  private getKVKey(apiKey: string): string {
-    const hash = this.simpleHash(apiKey);
-    return `key_status_${hash}`;
-  }
-
-  // Simple hash function for key identification
-  private simpleHash(str: string): string {
-    let hash = 0;
-    for (let i = 0; i < str.length; i++) {
-      const char = str.charCodeAt(i);
-      hash = ((hash << 5) - hash) + char;
-      hash = hash & hash;
-    }
-    return Math.abs(hash).toString(16);
-  }
-
-  // Check if we should reset disabled keys (15th of each month)
-  private shouldResetKeys(): { shouldReset: boolean; currentMonth: number } {
-    const now = new Date();
-    const day = now.getUTCDate();
-    const month = now.getUTCMonth() + 1;
-    
-    return {
-      shouldReset: day >= 15,
-      currentMonth: month,
-    };
-  }
-
-  // Check if a key is known to be disabled (memory cache only - NO KV read)
-  isKeyKnownDisabled(apiKey: string): boolean {
-    const kvKey = this.getKVKey(apiKey);
-    return disabledKeysCache.has(kvKey);
-  }
-
-  // Mark a key as disabled in memory cache
-  private markKeyDisabledInCache(apiKey: string): void {
-    const kvKey = this.getKVKey(apiKey);
-    disabledKeysCache.add(kvKey);
-  }
-
-  // Mark a key as disabled due to quota exhaustion (writes to KV)
-  async disableKey(apiKey: string, reason: string): Promise<void> {
-    // First, mark in memory cache (immediate effect for this instance)
-    this.markKeyDisabledInCache(apiKey);
-
-    // Then persist to KV for cross-instance consistency
-    try {
-      const kvKey = this.getKVKey(apiKey);
-      const { currentMonth } = this.shouldResetKeys();
-      
-      const status: KeyStatus = {
-        disabledAt: Date.now(),
-        reason: reason,
-        lastResetMonth: currentMonth,
-      };
-
-      await this.env.KEY_STATUS.put(kvKey, JSON.stringify(status), {
-        expirationTtl: 35 * 24 * 60 * 60, // 35 days
-      });
-
-      console.log(`Disabled key (hash: ${this.simpleHash(apiKey)}) - reason: ${reason}`);
-    } catch (error) {
-      console.error('Error persisting key status to KV:', error);
-    }
-  }
-
-  // Check KV for disabled status (only called when needed)
-  async isKeyDisabledInKV(apiKey: string): Promise<boolean> {
-    try {
-      const kvKey = this.getKVKey(apiKey);
-      const statusJson = await this.env.KEY_STATUS.get(kvKey);
-      
-      if (!statusJson) {
-        return false;
-      }
-
-      const status: KeyStatus = JSON.parse(statusJson);
-      const { shouldReset, currentMonth } = this.shouldResetKeys();
-
-      // If it's past the 15th and this key was disabled in a previous month, reset it
-      if (shouldReset && status.lastResetMonth !== currentMonth) {
-        console.log(`Resetting key (hash: ${this.simpleHash(apiKey)}) - new month reset`);
-        await this.env.KEY_STATUS.delete(kvKey);
-        return false;
-      }
-
-      // Key is disabled - also add to memory cache
-      this.markKeyDisabledInCache(apiKey);
-      return true;
-    } catch (error) {
-      console.error('Error checking key status in KV:', error);
-      return false;
-    }
-  }
-
-  // Check if error indicates quota exhaustion
-  isQuotaError(error: any): boolean {
-    const errorMessage = error?.message?.toLowerCase() || '';
-    const errorType = error?.type?.toLowerCase() || '';
-    
-    const quotaKeywords = [
-      'quota',
-      'insufficient',
-      'exceeded',
-      'limit reached',
-      'billing',
-      'payment required',
-      'credit',
-      'balance',
-      'usage limit',
-      'spending limit',
-    ];
-
-    return quotaKeywords.some(
-      (keyword) => errorMessage.includes(keyword) || errorType.includes(keyword)
-    );
-  }
-
-  // Get next key using round-robin (NO KV read - optimistic approach)
-  getNextKey(): string {
-    const key = this.keys[this.currentIndex];
-    this.currentIndex = (this.currentIndex + 1) % this.keys.length;
-    return key;
-  }
-
-  // Get all keys in round-robin order, excluding known disabled ones (memory only)
-  getKeysToTry(): string[] {
-    const result: string[] = [];
-    const startIndex = this.currentIndex;
-    
-    for (let i = 0; i < this.keys.length; i++) {
-      const index = (startIndex + i) % this.keys.length;
-      const key = this.keys[index];
-      
-      // Only skip if we KNOW it's disabled (from memory cache)
-      if (!this.isKeyKnownDisabled(key)) {
-        result.push(key);
-      }
-    }
-    
-    // Update current index for next request
-    this.currentIndex = (this.currentIndex + 1) % this.keys.length;
-    
-    return result;
-  }
-
-  // Get status summary (for health check only - this DOES read KV)
-  async getStatus(): Promise<{ total: number; available: number; disabled: number }> {
-    let disabled = 0;
-    
-    for (const key of this.keys) {
-      if (await this.isKeyDisabledInKV(key)) {
-        disabled++;
-      }
-    }
-
-    return {
-      total: this.keys.length,
-      available: this.keys.length - disabled,
-      disabled,
-    };
-  }
-
-  // Get total key count (no KV needed)
-  getTotalKeyCount(): number {
-    return this.keys.length;
-  }
-}
-
-// ==================== Main Export ====================
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -219,45 +19,22 @@ export default {
       return new Response(null, {
         headers: {
           'Access-Control-Allow-Origin': '*',
-          'Access-Control-Allow-Methods': 'POST, GET, OPTIONS',
+          'Access-Control-Allow-Methods': 'POST, OPTIONS',
           'Access-Control-Allow-Headers': 'Content-Type, Authorization, anthropic-version, x-api-key',
         },
       });
     }
 
-    // Initialize key manager
-    let keyManager: KeyManager;
-    try {
-      keyManager = new KeyManager(env);
-    } catch (error: any) {
-      return Response.json(
-        {
-          type: 'error',
-          error: {
-            type: 'configuration_error',
-            message: error.message,
-          },
-        },
-        { status: 500 }
-      );
-    }
-
-    // Health check with key status (this endpoint DOES read KV for accurate status)
+    // Health check
     if (url.pathname === '/' || url.pathname === '/health') {
-      const status = await keyManager.getStatus();
-      return Response.json({
-        status: 'ok',
-        message: 'Claude Code Vercel Proxy is running',
-        keys: status,
-        nextReset: getNextResetDate(),
-      });
+      return Response.json({ status: 'ok', message: 'Claude Code Vercel Proxy is running' });
     }
 
     // Main endpoint: /v1/messages
     if (url.pathname === '/v1/messages' && request.method === 'POST') {
       try {
         const body = (await request.json()) as AnthropicRequest;
-        return await handleMessagesWithRetry(body, keyManager);
+        return await handleMessages(body, env);
       } catch (error: any) {
         console.error('Error:', error);
         return Response.json(
@@ -286,106 +63,9 @@ export default {
   },
 };
 
-// Get next reset date (15th of current or next month)
-function getNextResetDate(): string {
-  const now = new Date();
-  const year = now.getUTCFullYear();
-  const month = now.getUTCMonth();
-  const day = now.getUTCDate();
-
-  let resetDate: Date;
-  if (day < 15) {
-    resetDate = new Date(Date.UTC(year, month, 15, 0, 0, 0));
-  } else {
-    resetDate = new Date(Date.UTC(year, month + 1, 15, 0, 0, 0));
-  }
-
-  return resetDate.toISOString();
-}
-
-// ==================== Main Handler with Retry ====================
-
-async function handleMessagesWithRetry(
-  body: AnthropicRequest,
-  keyManager: KeyManager
-): Promise<Response> {
-  // Get keys to try (uses memory cache only - NO KV reads)
-  const keysToTry = keyManager.getKeysToTry();
-
-  if (keysToTry.length === 0) {
-    // All keys are known to be disabled in memory cache
-    // This is rare - only happens if all keys hit quota in this Worker instance
-    return Response.json(
-      {
-        type: 'error',
-        error: {
-          type: 'quota_exhausted',
-          message: 'All API keys have exhausted their quota. Keys will reset on the 15th of each month.',
-          nextReset: getNextResetDate(),
-        },
-      },
-      { status: 429 }
-    );
-  }
-
-  let lastError: any = null;
-
-  for (const apiKey of keysToTry) {
-    try {
-      console.log(`Trying key (hash: ...${apiKey.slice(-8)})`);
-      const response = await handleMessages(body, apiKey);
-      
-      // Check if response is an error
-      if (!response.ok) {
-        const errorBody = await response.clone().json().catch(() => null);
-        
-        // Check if it's a quota error (429 or quota-related message)
-        if (response.status === 429 || (errorBody?.error && keyManager.isQuotaError(errorBody.error))) {
-          console.log(`Key quota exhausted, disabling and trying next...`);
-          // This is the ONLY place we write to KV
-          await keyManager.disableKey(apiKey, errorBody?.error?.message || 'Quota exhausted');
-          lastError = errorBody?.error;
-          continue; // Try next key
-        }
-        
-        // For non-quota errors, return the response as-is
-        return response;
-      }
-
-      // Success!
-      return response;
-    } catch (error: any) {
-      console.error(`Error with key:`, error.message);
-      
-      // Check if it's a quota error
-      if (keyManager.isQuotaError(error)) {
-        await keyManager.disableKey(apiKey, error.message || 'Quota exhausted');
-        lastError = error;
-        continue; // Try next key
-      }
-
-      // For non-quota errors, throw immediately
-      throw error;
-    }
-  }
-
-  // All keys failed with quota errors
-  return Response.json(
-    {
-      type: 'error',
-      error: {
-        type: 'quota_exhausted',
-        message: lastError?.message || 'All API keys have exhausted their quota.',
-        nextReset: getNextResetDate(),
-      },
-    },
-    { status: 429 }
-  );
-}
-
 // ==================== Main Handler ====================
 
-async function handleMessages(body: AnthropicRequest, apiKey: string): Promise<Response> {
+async function handleMessages(body: AnthropicRequest, env: Env): Promise<Response> {
   // Normalize model ID to gateway format (anthropic/model-name)
   const modelId = normalizeModelId(body.model);
 
@@ -412,8 +92,9 @@ async function handleMessages(body: AnthropicRequest, apiKey: string): Promise<R
   }
 
   // Create gateway instance with API key using createGateway
+  // This is the correct way to configure authentication
   const gateway = createGateway({
-    apiKey: apiKey,
+    apiKey: env.VERCEL_AI_GATEWAY_KEY,
   });
 
   // Get model from gateway
@@ -472,6 +153,7 @@ function convertMessagesToAISDK(messages: AnthropicMessage[]): CoreMessage[] {
       switch (block.type) {
         case 'text':
           const textPart: any = { type: 'text', text: block.text! };
+          // Add cache control if present
           if (block.cache_control) {
             textPart.providerOptions = {
               anthropic: {
@@ -483,6 +165,7 @@ function convertMessagesToAISDK(messages: AnthropicMessage[]): CoreMessage[] {
           break;
 
         case 'thinking':
+          // Include thinking as text for context
           if (block.thinking) {
             parts.push({ type: 'text', text: `<thinking>${block.thinking}</thinking>` });
           }
@@ -494,6 +177,7 @@ function convertMessagesToAISDK(messages: AnthropicMessage[]): CoreMessage[] {
               type: 'image',
               image: `data:${block.source.media_type};base64,${block.source.data}`,
             };
+            // Add cache control if present
             if (block.cache_control) {
               imagePart.providerOptions = {
                 anthropic: {
@@ -506,12 +190,14 @@ function convertMessagesToAISDK(messages: AnthropicMessage[]): CoreMessage[] {
           break;
 
         case 'document':
+          // Handle PDF documents
           if (block.source) {
             const docPart: any = {
               type: 'file',
               data: block.source.data,
               mimeType: block.source.media_type,
             };
+            // Add cache control if present
             if (block.cache_control) {
               docPart.providerOptions = {
                 anthropic: {
@@ -565,12 +251,14 @@ function buildSystemContent(
     return system;
   }
 
+  // Handle array of system content blocks with cache control
   return system.map((block) => {
     const content: any = {
       type: 'text',
       text: block.text,
     };
 
+    // Add cache control if present
     if (block.cache_control) {
       content.providerOptions = {
         anthropic: {
@@ -594,6 +282,7 @@ function convertToolsToAISDK(tools: AnthropicTool[]): Record<string, any> {
       parameters: convertJsonSchemaToZod(t.input_schema),
     };
 
+    // Add cache control if present on tool
     if (t.cache_control) {
       toolDef.providerOptions = {
         anthropic: {
@@ -666,17 +355,12 @@ function convertToolChoice(toolChoice: any): any {
 // ==================== Model ID ====================
 
 function normalizeModelId(model: string): string {
+  // Remove any existing prefix and add anthropic/ prefix for gateway
   const cleanModel = model.replace('anthropic/', '');
   return `anthropic/${cleanModel}`;
 }
 
 // ==================== Stream Response ====================
-
-// Helper to extract text from various possible property names in stream parts
-function extractTextDelta(part: any): string {
-  // Try various possible property names
-  return part.textDelta || part.text || part.delta?.text || part.content || '';
-}
 
 async function handleStreamResponse(options: any, originalModel: string): Promise<Response> {
   const result = streamText(options);
@@ -686,226 +370,205 @@ async function handleStreamResponse(options: any, originalModel: string): Promis
   let contentBlockIndex = 0;
   let hasStartedTextBlock = false;
   let hasThinkingBlock = false;
-  let hasAnyContent = false;
-  let streamError: any = null;
 
   const stream = new ReadableStream({
     async start(controller) {
-      // Helper function to send SSE event
-      const sendEvent = (event: string, data: any) => {
-        controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
-      };
-
       // Send message_start
-      sendEvent('message_start', {
-        type: 'message_start',
-        message: {
-          id: messageId,
-          type: 'message',
-          role: 'assistant',
-          content: [],
-          model: originalModel,
-          stop_reason: null,
-          stop_sequence: null,
-          usage: { input_tokens: 0, output_tokens: 0 },
-        },
-      });
+      controller.enqueue(
+        encoder.encode(
+          `event: message_start\ndata: ${JSON.stringify({
+            type: 'message_start',
+            message: {
+              id: messageId,
+              type: 'message',
+              role: 'assistant',
+              content: [],
+              model: originalModel,
+              stop_reason: null,
+              stop_sequence: null,
+              usage: { input_tokens: 0, output_tokens: 0 },
+            },
+          })}\n\n`
+        )
+      );
 
       try {
+        // Process the stream using fullStream
         for await (const part of result.fullStream) {
-          // Debug logging - helps identify what events are being received
-          console.log('Stream part type:', part.type, JSON.stringify(part).substring(0, 200));
-
           switch (part.type) {
-            case 'error':
-              // Handle error events from the stream
-              streamError = part.error;
-              console.error('Stream error event:', part.error);
-              sendEvent('error', {
-                type: 'error',
-                error: { 
-                  type: 'api_error', 
-                  message: part.error?.message || 'Unknown stream error' 
-                },
-              });
-              break;
-
             case 'reasoning':
-              hasAnyContent = true;
+              // Handle reasoning/thinking blocks
               if (!hasThinkingBlock) {
-                sendEvent('content_block_start', {
-                  type: 'content_block_start',
-                  index: contentBlockIndex,
-                  content_block: { type: 'thinking', thinking: '' },
-                });
+                // Start thinking block
+                controller.enqueue(
+                  encoder.encode(
+                    `event: content_block_start\ndata: ${JSON.stringify({
+                      type: 'content_block_start',
+                      index: contentBlockIndex,
+                      content_block: { type: 'thinking', thinking: '' },
+                    })}\n\n`
+                  )
+                );
                 hasThinkingBlock = true;
               }
-              const thinkingText = extractTextDelta(part);
-              if (thinkingText) {
-                sendEvent('content_block_delta', {
-                  type: 'content_block_delta',
-                  index: contentBlockIndex,
-                  delta: { type: 'thinking_delta', thinking: thinkingText },
-                });
-              }
+              controller.enqueue(
+                encoder.encode(
+                  `event: content_block_delta\ndata: ${JSON.stringify({
+                    type: 'content_block_delta',
+                    index: contentBlockIndex,
+                    delta: { type: 'thinking_delta', thinking: part.textDelta },
+                  })}\n\n`
+                )
+              );
               break;
 
             case 'text-delta':
-              hasAnyContent = true;
+              // If we were in thinking mode, close it first
               if (hasThinkingBlock && !hasStartedTextBlock) {
-                sendEvent('content_block_stop', {
-                  type: 'content_block_stop',
-                  index: contentBlockIndex,
-                });
+                controller.enqueue(
+                  encoder.encode(
+                    `event: content_block_stop\ndata: ${JSON.stringify({
+                      type: 'content_block_stop',
+                      index: contentBlockIndex,
+                    })}\n\n`
+                  )
+                );
                 contentBlockIndex++;
                 hasThinkingBlock = false;
               }
 
+              // Start text block if not started
               if (!hasStartedTextBlock) {
-                sendEvent('content_block_start', {
-                  type: 'content_block_start',
-                  index: contentBlockIndex,
-                  content_block: { type: 'text', text: '' },
-                });
+                controller.enqueue(
+                  encoder.encode(
+                    `event: content_block_start\ndata: ${JSON.stringify({
+                      type: 'content_block_start',
+                      index: contentBlockIndex,
+                      content_block: { type: 'text', text: '' },
+                    })}\n\n`
+                  )
+                );
                 hasStartedTextBlock = true;
               }
 
-              const textContent = extractTextDelta(part);
-              if (textContent) {
-                sendEvent('content_block_delta', {
-                  type: 'content_block_delta',
-                  index: contentBlockIndex,
-                  delta: { type: 'text_delta', text: textContent },
-                });
-              }
+              controller.enqueue(
+                encoder.encode(
+                  `event: content_block_delta\ndata: ${JSON.stringify({
+                    type: 'content_block_delta',
+                    index: contentBlockIndex,
+                    delta: { type: 'text_delta', text: part.textDelta },
+                  })}\n\n`
+                )
+              );
               break;
 
             case 'tool-call':
-              hasAnyContent = true;
+              // Close any open block first
               if (hasStartedTextBlock || hasThinkingBlock) {
-                sendEvent('content_block_stop', {
-                  type: 'content_block_stop',
-                  index: contentBlockIndex,
-                });
+                controller.enqueue(
+                  encoder.encode(
+                    `event: content_block_stop\ndata: ${JSON.stringify({
+                      type: 'content_block_stop',
+                      index: contentBlockIndex,
+                    })}\n\n`
+                  )
+                );
                 contentBlockIndex++;
                 hasStartedTextBlock = false;
                 hasThinkingBlock = false;
               }
 
-              sendEvent('content_block_start', {
-                type: 'content_block_start',
-                index: contentBlockIndex,
-                content_block: {
-                  type: 'tool_use',
-                  id: part.toolCallId,
-                  name: part.toolName,
-                  input: {},
-                },
-              });
+              // Start tool use block
+              controller.enqueue(
+                encoder.encode(
+                  `event: content_block_start\ndata: ${JSON.stringify({
+                    type: 'content_block_start',
+                    index: contentBlockIndex,
+                    content_block: {
+                      type: 'tool_use',
+                      id: part.toolCallId,
+                      name: part.toolName,
+                      input: {},
+                    },
+                  })}\n\n`
+                )
+              );
 
-              sendEvent('content_block_delta', {
-                type: 'content_block_delta',
-                index: contentBlockIndex,
-                delta: {
-                  type: 'input_json_delta',
-                  partial_json: JSON.stringify(part.args),
-                },
-              });
+              controller.enqueue(
+                encoder.encode(
+                  `event: content_block_delta\ndata: ${JSON.stringify({
+                    type: 'content_block_delta',
+                    index: contentBlockIndex,
+                    delta: {
+                      type: 'input_json_delta',
+                      partial_json: JSON.stringify(part.args),
+                    },
+                  })}\n\n`
+                )
+              );
 
-              sendEvent('content_block_stop', {
-                type: 'content_block_stop',
-                index: contentBlockIndex,
-              });
+              controller.enqueue(
+                encoder.encode(
+                  `event: content_block_stop\ndata: ${JSON.stringify({
+                    type: 'content_block_stop',
+                    index: contentBlockIndex,
+                  })}\n\n`
+                )
+              );
               contentBlockIndex++;
               break;
 
             case 'finish':
+              // Close any open block
               if (hasStartedTextBlock || hasThinkingBlock) {
-                sendEvent('content_block_stop', {
-                  type: 'content_block_stop',
-                  index: contentBlockIndex,
-                });
+                controller.enqueue(
+                  encoder.encode(
+                    `event: content_block_stop\ndata: ${JSON.stringify({
+                      type: 'content_block_stop',
+                      index: contentBlockIndex,
+                    })}\n\n`
+                  )
+                );
               }
 
+              // Get usage from finish event
               const usage = part.usage || { promptTokens: 0, completionTokens: 0 };
 
-              sendEvent('message_delta', {
-                type: 'message_delta',
-                delta: {
-                  stop_reason: part.finishReason === 'tool-calls' ? 'tool_use' : 'end_turn',
-                  stop_sequence: null,
-                },
-                usage: { output_tokens: usage.completionTokens || 0 },
-              });
+              // Send message_delta
+              controller.enqueue(
+                encoder.encode(
+                  `event: message_delta\ndata: ${JSON.stringify({
+                    type: 'message_delta',
+                    delta: {
+                      stop_reason: part.finishReason === 'tool-calls' ? 'tool_use' : 'end_turn',
+                      stop_sequence: null,
+                    },
+                    usage: { output_tokens: usage.completionTokens || 0 },
+                  })}\n\n`
+                )
+              );
 
-              sendEvent('message_stop', {
-                type: 'message_stop',
-              });
-              hasAnyContent = true; // Mark as having content to prevent error message
-              break;
-
-            // Handle other event types that might come through
-            case 'step-start':
-            case 'step-finish':
-              // These are informational, no action needed
-              console.log('Informational event:', part.type);
-              break;
-
-            default:
-              // Log unknown event types for debugging
-              console.log('Unknown stream part type:', part.type, part);
+              // Send message_stop
+              controller.enqueue(
+                encoder.encode(
+                  `event: message_stop\ndata: ${JSON.stringify({
+                    type: 'message_stop',
+                  })}\n\n`
+                )
+              );
               break;
           }
         }
-
-        // If we got here without any content and no explicit error, something went wrong
-        if (!hasAnyContent && !streamError) {
-          console.error('Stream ended without any content');
-          sendEvent('content_block_start', {
-            type: 'content_block_start',
-            index: 0,
-            content_block: { type: 'text', text: '' },
-          });
-          sendEvent('content_block_delta', {
-            type: 'content_block_delta',
-            index: 0,
-            delta: { type: 'text_delta', text: '[Error: No response received from API]' },
-          });
-          sendEvent('content_block_stop', {
-            type: 'content_block_stop',
-            index: 0,
-          });
-          sendEvent('message_delta', {
-            type: 'message_delta',
-            delta: { stop_reason: 'end_turn', stop_sequence: null },
-            usage: { output_tokens: 0 },
-          });
-          sendEvent('message_stop', { type: 'message_stop' });
-        }
       } catch (error: any) {
-        console.error('Stream iteration error:', error);
-        
-        // Send error event
-        sendEvent('error', {
-          type: 'error',
-          error: { type: 'api_error', message: error.message || 'Stream processing error' },
-        });
-
-        // Close any open blocks
-        if (hasStartedTextBlock || hasThinkingBlock) {
-          sendEvent('content_block_stop', {
-            type: 'content_block_stop',
-            index: contentBlockIndex,
-          });
-        }
-
-        // Send proper closing events
-        sendEvent('message_delta', {
-          type: 'message_delta',
-          delta: { stop_reason: 'error', stop_sequence: null },
-          usage: { output_tokens: 0 },
-        });
-        sendEvent('message_stop', { type: 'message_stop' });
+        console.error('Stream error:', error);
+        controller.enqueue(
+          encoder.encode(
+            `event: error\ndata: ${JSON.stringify({
+              type: 'error',
+              error: { type: 'api_error', message: error.message },
+            })}\n\n`
+          )
+        );
       }
 
       controller.close();
@@ -927,8 +590,10 @@ async function handleStreamResponse(options: any, originalModel: string): Promis
 async function handleNonStreamResponse(options: any, originalModel: string): Promise<Response> {
   const result = await generateText(options);
 
+  // Build Anthropic format response
   const content: ContentBlock[] = [];
 
+  // Add thinking if present (check multiple possible properties)
   const thinkingContent = (result as any).reasoning || (result as any).reasoningText;
   if (thinkingContent) {
     content.push({
@@ -937,6 +602,7 @@ async function handleNonStreamResponse(options: any, originalModel: string): Pro
     });
   }
 
+  // Add text
   if (result.text) {
     content.push({
       type: 'text',
@@ -944,6 +610,7 @@ async function handleNonStreamResponse(options: any, originalModel: string): Pro
     });
   }
 
+  // Add tool calls
   if (result.toolCalls && result.toolCalls.length > 0) {
     for (const toolCall of result.toolCalls) {
       content.push({
@@ -955,6 +622,7 @@ async function handleNonStreamResponse(options: any, originalModel: string): Pro
     }
   }
 
+  // Build response with cache metadata if available
   const response: any = {
     id: `msg_${Date.now()}`,
     type: 'message',
@@ -969,6 +637,7 @@ async function handleNonStreamResponse(options: any, originalModel: string): Pro
     },
   };
 
+  // Add cache usage if available from provider metadata
   const anthropicMetadata = (result as any).providerMetadata?.anthropic;
   if (anthropicMetadata) {
     if (anthropicMetadata.cacheCreationInputTokens !== undefined) {
