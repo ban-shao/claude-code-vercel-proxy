@@ -686,6 +686,8 @@ async function handleStreamResponse(options: any, originalModel: string): Promis
   let contentBlockIndex = 0;
   let hasStartedTextBlock = false;
   let hasThinkingBlock = false;
+  let hasAnyContent = false;
+  let streamError: any = null;
 
   const stream = new ReadableStream({
     async start(controller) {
@@ -711,11 +713,25 @@ async function handleStreamResponse(options: any, originalModel: string): Promis
 
       try {
         for await (const part of result.fullStream) {
-          // Debug logging (can be removed in production)
-          // console.log('Stream part:', JSON.stringify(part));
+          // Debug logging - helps identify what events are being received
+          console.log('Stream part type:', part.type, JSON.stringify(part).substring(0, 200));
 
           switch (part.type) {
+            case 'error':
+              // Handle error events from the stream
+              streamError = part.error;
+              console.error('Stream error event:', part.error);
+              sendEvent('error', {
+                type: 'error',
+                error: { 
+                  type: 'api_error', 
+                  message: part.error?.message || 'Unknown stream error' 
+                },
+              });
+              break;
+
             case 'reasoning':
+              hasAnyContent = true;
               if (!hasThinkingBlock) {
                 sendEvent('content_block_start', {
                   type: 'content_block_start',
@@ -735,6 +751,7 @@ async function handleStreamResponse(options: any, originalModel: string): Promis
               break;
 
             case 'text-delta':
+              hasAnyContent = true;
               if (hasThinkingBlock && !hasStartedTextBlock) {
                 sendEvent('content_block_stop', {
                   type: 'content_block_stop',
@@ -764,6 +781,7 @@ async function handleStreamResponse(options: any, originalModel: string): Promis
               break;
 
             case 'tool-call':
+              hasAnyContent = true;
               if (hasStartedTextBlock || hasThinkingBlock) {
                 sendEvent('content_block_stop', {
                   type: 'content_block_stop',
@@ -823,15 +841,71 @@ async function handleStreamResponse(options: any, originalModel: string): Promis
               sendEvent('message_stop', {
                 type: 'message_stop',
               });
+              hasAnyContent = true; // Mark as having content to prevent error message
+              break;
+
+            // Handle other event types that might come through
+            case 'step-start':
+            case 'step-finish':
+              // These are informational, no action needed
+              console.log('Informational event:', part.type);
+              break;
+
+            default:
+              // Log unknown event types for debugging
+              console.log('Unknown stream part type:', part.type, part);
               break;
           }
         }
+
+        // If we got here without any content and no explicit error, something went wrong
+        if (!hasAnyContent && !streamError) {
+          console.error('Stream ended without any content');
+          sendEvent('content_block_start', {
+            type: 'content_block_start',
+            index: 0,
+            content_block: { type: 'text', text: '' },
+          });
+          sendEvent('content_block_delta', {
+            type: 'content_block_delta',
+            index: 0,
+            delta: { type: 'text_delta', text: '[Error: No response received from API]' },
+          });
+          sendEvent('content_block_stop', {
+            type: 'content_block_stop',
+            index: 0,
+          });
+          sendEvent('message_delta', {
+            type: 'message_delta',
+            delta: { stop_reason: 'end_turn', stop_sequence: null },
+            usage: { output_tokens: 0 },
+          });
+          sendEvent('message_stop', { type: 'message_stop' });
+        }
       } catch (error: any) {
-        console.error('Stream error:', error);
+        console.error('Stream iteration error:', error);
+        
+        // Send error event
         sendEvent('error', {
           type: 'error',
-          error: { type: 'api_error', message: error.message },
+          error: { type: 'api_error', message: error.message || 'Stream processing error' },
         });
+
+        // Close any open blocks
+        if (hasStartedTextBlock || hasThinkingBlock) {
+          sendEvent('content_block_stop', {
+            type: 'content_block_stop',
+            index: contentBlockIndex,
+          });
+        }
+
+        // Send proper closing events
+        sendEvent('message_delta', {
+          type: 'message_delta',
+          delta: { stop_reason: 'error', stop_sequence: null },
+          usage: { output_tokens: 0 },
+        });
+        sendEvent('message_stop', { type: 'message_stop' });
       }
 
       controller.close();
