@@ -13,6 +13,15 @@ import type {
 
 // ==================== Key Management ====================
 
+// In-memory cache for key status (reduces KV reads)
+interface CachedKeyStatus {
+  isDisabled: boolean;
+  cachedAt: number;
+}
+
+const keyStatusCache = new Map<string, CachedKeyStatus>();
+const CACHE_TTL_MS = 60 * 1000; // Cache for 60 seconds
+
 class KeyManager {
   private keys: string[];
   private currentIndex: number = 0;
@@ -65,13 +74,48 @@ class KeyManager {
     };
   }
 
-  // Check if a key is disabled
+  // Check cache first, then KV if needed
+  private getCachedStatus(apiKey: string): CachedKeyStatus | null {
+    const kvKey = this.getKVKey(apiKey);
+    const cached = keyStatusCache.get(kvKey);
+    
+    if (cached && (Date.now() - cached.cachedAt) < CACHE_TTL_MS) {
+      return cached;
+    }
+    
+    return null;
+  }
+
+  // Update cache
+  private setCachedStatus(apiKey: string, isDisabled: boolean): void {
+    const kvKey = this.getKVKey(apiKey);
+    keyStatusCache.set(kvKey, {
+      isDisabled,
+      cachedAt: Date.now(),
+    });
+  }
+
+  // Clear cache for a key (when status changes)
+  private clearCachedStatus(apiKey: string): void {
+    const kvKey = this.getKVKey(apiKey);
+    keyStatusCache.delete(kvKey);
+  }
+
+  // Check if a key is disabled (with caching)
   async isKeyDisabled(apiKey: string): Promise<boolean> {
+    // Check memory cache first
+    const cached = this.getCachedStatus(apiKey);
+    if (cached !== null) {
+      return cached.isDisabled;
+    }
+
+    // Cache miss - check KV
     try {
       const kvKey = this.getKVKey(apiKey);
       const statusJson = await this.env.KEY_STATUS.get(kvKey);
       
       if (!statusJson) {
+        this.setCachedStatus(apiKey, false);
         return false;
       }
 
@@ -82,9 +126,11 @@ class KeyManager {
       if (shouldReset && status.lastResetMonth !== currentMonth) {
         console.log(`Resetting key (hash: ${this.simpleHash(apiKey)}) - new month reset`);
         await this.env.KEY_STATUS.delete(kvKey);
+        this.setCachedStatus(apiKey, false);
         return false;
       }
 
+      this.setCachedStatus(apiKey, true);
       return true;
     } catch (error) {
       console.error('Error checking key status:', error);
@@ -108,6 +154,9 @@ class KeyManager {
       await this.env.KEY_STATUS.put(kvKey, JSON.stringify(status), {
         expirationTtl: 35 * 24 * 60 * 60, // 35 days in seconds
       });
+
+      // Update cache immediately
+      this.setCachedStatus(apiKey, true);
 
       console.log(`Disabled key (hash: ${this.simpleHash(apiKey)}) - reason: ${reason}`);
     } catch (error) {
@@ -138,7 +187,7 @@ class KeyManager {
     );
   }
 
-  // Get next available key
+  // Get next available key (optimized: try keys directly, only check KV on error)
   async getNextAvailableKey(): Promise<string | null> {
     const totalKeys = this.keys.length;
     let attempts = 0;
@@ -157,7 +206,7 @@ class KeyManager {
     return null; // All keys are disabled
   }
 
-  // Get all keys (for trying multiple on error)
+  // Get all available keys (uses cache to minimize KV reads)
   async getAvailableKeys(): Promise<string[]> {
     const available: string[] = [];
     
@@ -176,13 +225,26 @@ class KeyManager {
     return available;
   }
 
-  // Get status summary
-  async getStatus(): Promise<{ total: number; available: number; disabled: number }> {
+  // Get status summary (for health check - can skip cache for accurate status)
+  async getStatus(useCache: boolean = true): Promise<{ total: number; available: number; disabled: number }> {
     let disabled = 0;
     
     for (const key of this.keys) {
-      if (await this.isKeyDisabled(key)) {
-        disabled++;
+      if (useCache) {
+        if (await this.isKeyDisabled(key)) {
+          disabled++;
+        }
+      } else {
+        // Force KV check for health endpoint (bypass cache)
+        const kvKey = this.getKVKey(key);
+        const statusJson = await this.env.KEY_STATUS.get(kvKey);
+        if (statusJson) {
+          const status: KeyStatus = JSON.parse(statusJson);
+          const { shouldReset, currentMonth } = this.shouldResetKeys();
+          if (!(shouldReset && status.lastResetMonth !== currentMonth)) {
+            disabled++;
+          }
+        }
       }
     }
 
@@ -191,6 +253,11 @@ class KeyManager {
       available: this.keys.length - disabled,
       disabled,
     };
+  }
+
+  // Get total key count (no KV needed)
+  getTotalKeyCount(): number {
+    return this.keys.length;
   }
 }
 
@@ -228,9 +295,9 @@ export default {
       );
     }
 
-    // Health check with key status
+    // Health check with key status (bypass cache for accurate status)
     if (url.pathname === '/' || url.pathname === '/health') {
-      const status = await keyManager.getStatus();
+      const status = await keyManager.getStatus(false); // false = bypass cache
       return Response.json({
         status: 'ok',
         message: 'Claude Code Vercel Proxy is running',
