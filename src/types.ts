@@ -134,8 +134,32 @@ export interface AnthropicTool {
 
 export interface JsonSchema {
   type: 'object';
-  properties?: Record<string, unknown>;
+  properties?: Record<string, JsonSchemaProperty>;
   required?: string[];
+  additionalProperties?: boolean;
+  [key: string]: unknown;
+}
+
+export interface JsonSchemaProperty {
+  type?: string | string[];
+  description?: string;
+  enum?: unknown[];
+  items?: JsonSchemaProperty;
+  properties?: Record<string, JsonSchemaProperty>;
+  required?: string[];
+  additionalProperties?: boolean | JsonSchemaProperty;
+  anyOf?: JsonSchemaProperty[];
+  oneOf?: JsonSchemaProperty[];
+  allOf?: JsonSchemaProperty[];
+  $ref?: string;
+  default?: unknown;
+  minimum?: number;
+  maximum?: number;
+  minLength?: number;
+  maxLength?: number;
+  pattern?: string;
+  format?: string;
+  nullable?: boolean;
   [key: string]: unknown;
 }
 

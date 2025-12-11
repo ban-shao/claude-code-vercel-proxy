@@ -1,12 +1,12 @@
 {
   "name": "claude-code-vercel-proxy",
-  "version": "2.2.0",
-  "description": "Anthropic API proxy via Vercel AI Gateway for Cloudflare Workers",
+  "version": "2.3.0",
+  "description": "Cloudflare Worker proxy for Anthropic API via Vercel AI Gateway",
   "main": "src/index.ts",
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
-    "lint": "tsc --noEmit"
+    "test": "echo \"No tests yet\""
   },
   "dependencies": {
     "@ai-sdk/gateway": "^1.0.11",
@@ -14,8 +14,8 @@
     "zod": "^3.24.0"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^4.20250214.0",
-    "typescript": "^5.7.3",
+    "@cloudflare/workers-types": "^4.20241230.0",
+    "typescript": "^5.7.2",
     "wrangler": "^4.0.0"
   }
 }
