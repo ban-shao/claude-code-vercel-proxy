@@ -13,14 +13,9 @@ import type {
 
 // ==================== Key Management ====================
 
-// In-memory cache for key status (reduces KV reads)
-interface CachedKeyStatus {
-  isDisabled: boolean;
-  cachedAt: number;
-}
-
-const keyStatusCache = new Map<string, CachedKeyStatus>();
-const CACHE_TTL_MS = 60 * 1000; // Cache for 60 seconds
+// Disabled keys cache (populated only when we encounter quota errors)
+// This is a lightweight in-memory set that persists within a single Worker instance
+const disabledKeysCache = new Set<string>();
 
 class KeyManager {
   private keys: string[];
@@ -45,7 +40,6 @@ class KeyManager {
 
   // Get KV key for storing status
   private getKVKey(apiKey: string): string {
-    // Use hash of the key to avoid storing actual key
     const hash = this.simpleHash(apiKey);
     return `key_status_${hash}`;
   }
@@ -56,7 +50,7 @@ class KeyManager {
     for (let i = 0; i < str.length; i++) {
       const char = str.charCodeAt(i);
       hash = ((hash << 5) - hash) + char;
-      hash = hash & hash; // Convert to 32bit integer
+      hash = hash & hash;
     }
     return Math.abs(hash).toString(16);
   }
@@ -65,81 +59,32 @@ class KeyManager {
   private shouldResetKeys(): { shouldReset: boolean; currentMonth: number } {
     const now = new Date();
     const day = now.getUTCDate();
-    const month = now.getUTCMonth() + 1; // 1-12
+    const month = now.getUTCMonth() + 1;
     
-    // Reset on or after the 15th of each month
     return {
       shouldReset: day >= 15,
       currentMonth: month,
     };
   }
 
-  // Check cache first, then KV if needed
-  private getCachedStatus(apiKey: string): CachedKeyStatus | null {
+  // Check if a key is known to be disabled (memory cache only - NO KV read)
+  isKeyKnownDisabled(apiKey: string): boolean {
     const kvKey = this.getKVKey(apiKey);
-    const cached = keyStatusCache.get(kvKey);
-    
-    if (cached && (Date.now() - cached.cachedAt) < CACHE_TTL_MS) {
-      return cached;
-    }
-    
-    return null;
+    return disabledKeysCache.has(kvKey);
   }
 
-  // Update cache
-  private setCachedStatus(apiKey: string, isDisabled: boolean): void {
+  // Mark a key as disabled in memory cache
+  private markKeyDisabledInCache(apiKey: string): void {
     const kvKey = this.getKVKey(apiKey);
-    keyStatusCache.set(kvKey, {
-      isDisabled,
-      cachedAt: Date.now(),
-    });
+    disabledKeysCache.add(kvKey);
   }
 
-  // Clear cache for a key (when status changes)
-  private clearCachedStatus(apiKey: string): void {
-    const kvKey = this.getKVKey(apiKey);
-    keyStatusCache.delete(kvKey);
-  }
-
-  // Check if a key is disabled (with caching)
-  async isKeyDisabled(apiKey: string): Promise<boolean> {
-    // Check memory cache first
-    const cached = this.getCachedStatus(apiKey);
-    if (cached !== null) {
-      return cached.isDisabled;
-    }
-
-    // Cache miss - check KV
-    try {
-      const kvKey = this.getKVKey(apiKey);
-      const statusJson = await this.env.KEY_STATUS.get(kvKey);
-      
-      if (!statusJson) {
-        this.setCachedStatus(apiKey, false);
-        return false;
-      }
-
-      const status: KeyStatus = JSON.parse(statusJson);
-      const { shouldReset, currentMonth } = this.shouldResetKeys();
-
-      // If it's past the 15th and this key was disabled in a previous month, reset it
-      if (shouldReset && status.lastResetMonth !== currentMonth) {
-        console.log(`Resetting key (hash: ${this.simpleHash(apiKey)}) - new month reset`);
-        await this.env.KEY_STATUS.delete(kvKey);
-        this.setCachedStatus(apiKey, false);
-        return false;
-      }
-
-      this.setCachedStatus(apiKey, true);
-      return true;
-    } catch (error) {
-      console.error('Error checking key status:', error);
-      return false; // Assume key is valid if KV fails
-    }
-  }
-
-  // Mark a key as disabled due to quota exhaustion
+  // Mark a key as disabled due to quota exhaustion (writes to KV)
   async disableKey(apiKey: string, reason: string): Promise<void> {
+    // First, mark in memory cache (immediate effect for this instance)
+    this.markKeyDisabledInCache(apiKey);
+
+    // Then persist to KV for cross-instance consistency
     try {
       const kvKey = this.getKVKey(apiKey);
       const { currentMonth } = this.shouldResetKeys();
@@ -150,17 +95,42 @@ class KeyManager {
         lastResetMonth: currentMonth,
       };
 
-      // Store with expiration of 35 days (ensures it lasts until next reset)
       await this.env.KEY_STATUS.put(kvKey, JSON.stringify(status), {
-        expirationTtl: 35 * 24 * 60 * 60, // 35 days in seconds
+        expirationTtl: 35 * 24 * 60 * 60, // 35 days
       });
-
-      // Update cache immediately
-      this.setCachedStatus(apiKey, true);
 
       console.log(`Disabled key (hash: ${this.simpleHash(apiKey)}) - reason: ${reason}`);
     } catch (error) {
-      console.error('Error disabling key:', error);
+      console.error('Error persisting key status to KV:', error);
+    }
+  }
+
+  // Check KV for disabled status (only called when needed)
+  async isKeyDisabledInKV(apiKey: string): Promise<boolean> {
+    try {
+      const kvKey = this.getKVKey(apiKey);
+      const statusJson = await this.env.KEY_STATUS.get(kvKey);
+      
+      if (!statusJson) {
+        return false;
+      }
+
+      const status: KeyStatus = JSON.parse(statusJson);
+      const { shouldReset, currentMonth } = this.shouldResetKeys();
+
+      // If it's past the 15th and this key was disabled in a previous month, reset it
+      if (shouldReset && status.lastResetMonth !== currentMonth) {
+        console.log(`Resetting key (hash: ${this.simpleHash(apiKey)}) - new month reset`);
+        await this.env.KEY_STATUS.delete(kvKey);
+        return false;
+      }
+
+      // Key is disabled - also add to memory cache
+      this.markKeyDisabledInCache(apiKey);
+      return true;
+    } catch (error) {
+      console.error('Error checking key status in KV:', error);
+      return false;
     }
   }
 
@@ -187,64 +157,41 @@ class KeyManager {
     );
   }
 
-  // Get next available key (optimized: try keys directly, only check KV on error)
-  async getNextAvailableKey(): Promise<string | null> {
-    const totalKeys = this.keys.length;
-    let attempts = 0;
-
-    while (attempts < totalKeys) {
-      const key = this.keys[this.currentIndex];
-      this.currentIndex = (this.currentIndex + 1) % totalKeys;
-
-      if (!(await this.isKeyDisabled(key))) {
-        return key;
-      }
-
-      attempts++;
-    }
-
-    return null; // All keys are disabled
+  // Get next key using round-robin (NO KV read - optimistic approach)
+  getNextKey(): string {
+    const key = this.keys[this.currentIndex];
+    this.currentIndex = (this.currentIndex + 1) % this.keys.length;
+    return key;
   }
 
-  // Get all available keys (uses cache to minimize KV reads)
-  async getAvailableKeys(): Promise<string[]> {
-    const available: string[] = [];
+  // Get all keys in round-robin order, excluding known disabled ones (memory only)
+  getKeysToTry(): string[] {
+    const result: string[] = [];
+    const startIndex = this.currentIndex;
     
-    for (const key of this.keys) {
-      if (!(await this.isKeyDisabled(key))) {
-        available.push(key);
+    for (let i = 0; i < this.keys.length; i++) {
+      const index = (startIndex + i) % this.keys.length;
+      const key = this.keys[index];
+      
+      // Only skip if we KNOW it's disabled (from memory cache)
+      if (!this.isKeyKnownDisabled(key)) {
+        result.push(key);
       }
     }
-
-    // Rotate starting point for load balancing
-    if (available.length > 1) {
-      const rotateCount = this.currentIndex % available.length;
-      return [...available.slice(rotateCount), ...available.slice(0, rotateCount)];
-    }
-
-    return available;
+    
+    // Update current index for next request
+    this.currentIndex = (this.currentIndex + 1) % this.keys.length;
+    
+    return result;
   }
 
-  // Get status summary (for health check - can skip cache for accurate status)
-  async getStatus(useCache: boolean = true): Promise<{ total: number; available: number; disabled: number }> {
+  // Get status summary (for health check only - this DOES read KV)
+  async getStatus(): Promise<{ total: number; available: number; disabled: number }> {
     let disabled = 0;
     
     for (const key of this.keys) {
-      if (useCache) {
-        if (await this.isKeyDisabled(key)) {
-          disabled++;
-        }
-      } else {
-        // Force KV check for health endpoint (bypass cache)
-        const kvKey = this.getKVKey(key);
-        const statusJson = await this.env.KEY_STATUS.get(kvKey);
-        if (statusJson) {
-          const status: KeyStatus = JSON.parse(statusJson);
-          const { shouldReset, currentMonth } = this.shouldResetKeys();
-          if (!(shouldReset && status.lastResetMonth !== currentMonth)) {
-            disabled++;
-          }
-        }
+      if (await this.isKeyDisabledInKV(key)) {
+        disabled++;
       }
     }
 
@@ -295,9 +242,9 @@ export default {
       );
     }
 
-    // Health check with key status (bypass cache for accurate status)
+    // Health check with key status (this endpoint DOES read KV for accurate status)
     if (url.pathname === '/' || url.pathname === '/health') {
-      const status = await keyManager.getStatus(false); // false = bypass cache
+      const status = await keyManager.getStatus();
       return Response.json({
         status: 'ok',
         message: 'Claude Code Vercel Proxy is running',
@@ -348,10 +295,8 @@ function getNextResetDate(): string {
 
   let resetDate: Date;
   if (day < 15) {
-    // Reset is this month on the 15th
     resetDate = new Date(Date.UTC(year, month, 15, 0, 0, 0));
   } else {
-    // Reset is next month on the 15th
     resetDate = new Date(Date.UTC(year, month + 1, 15, 0, 0, 0));
   }
 
@@ -364,9 +309,12 @@ async function handleMessagesWithRetry(
   body: AnthropicRequest,
   keyManager: KeyManager
 ): Promise<Response> {
-  const availableKeys = await keyManager.getAvailableKeys();
+  // Get keys to try (uses memory cache only - NO KV reads)
+  const keysToTry = keyManager.getKeysToTry();
 
-  if (availableKeys.length === 0) {
+  if (keysToTry.length === 0) {
+    // All keys are known to be disabled in memory cache
+    // This is rare - only happens if all keys hit quota in this Worker instance
     return Response.json(
       {
         type: 'error',
@@ -382,20 +330,21 @@ async function handleMessagesWithRetry(
 
   let lastError: any = null;
 
-  for (const apiKey of availableKeys) {
+  for (const apiKey of keysToTry) {
     try {
-      console.log(`Trying key (hash: ${apiKey.slice(-8)}...)`);
+      console.log(`Trying key (hash: ...${apiKey.slice(-8)})`);
       const response = await handleMessages(body, apiKey);
       
       // Check if response is an error
       if (!response.ok) {
         const errorBody = await response.clone().json().catch(() => null);
         
-        // Check if it's a quota error
-        if (errorBody?.error && keyManager.isQuotaError(errorBody.error)) {
+        // Check if it's a quota error (429 or quota-related message)
+        if (response.status === 429 || (errorBody?.error && keyManager.isQuotaError(errorBody.error))) {
           console.log(`Key quota exhausted, disabling and trying next...`);
-          await keyManager.disableKey(apiKey, errorBody.error.message || 'Quota exhausted');
-          lastError = errorBody.error;
+          // This is the ONLY place we write to KV
+          await keyManager.disableKey(apiKey, errorBody?.error?.message || 'Quota exhausted');
+          lastError = errorBody?.error;
           continue; // Try next key
         }
         
@@ -403,6 +352,7 @@ async function handleMessagesWithRetry(
         return response;
       }
 
+      // Success!
       return response;
     } catch (error: any) {
       console.error(`Error with key:`, error.message);
@@ -522,7 +472,6 @@ function convertMessagesToAISDK(messages: AnthropicMessage[]): CoreMessage[] {
       switch (block.type) {
         case 'text':
           const textPart: any = { type: 'text', text: block.text! };
-          // Add cache control if present
           if (block.cache_control) {
             textPart.providerOptions = {
               anthropic: {
@@ -534,7 +483,6 @@ function convertMessagesToAISDK(messages: AnthropicMessage[]): CoreMessage[] {
           break;
 
         case 'thinking':
-          // Include thinking as text for context
           if (block.thinking) {
             parts.push({ type: 'text', text: `<thinking>${block.thinking}</thinking>` });
           }
@@ -546,7 +494,6 @@ function convertMessagesToAISDK(messages: AnthropicMessage[]): CoreMessage[] {
               type: 'image',
               image: `data:${block.source.media_type};base64,${block.source.data}`,
             };
-            // Add cache control if present
             if (block.cache_control) {
               imagePart.providerOptions = {
                 anthropic: {
@@ -559,14 +506,12 @@ function convertMessagesToAISDK(messages: AnthropicMessage[]): CoreMessage[] {
           break;
 
         case 'document':
-          // Handle PDF documents
           if (block.source) {
             const docPart: any = {
               type: 'file',
               data: block.source.data,
               mimeType: block.source.media_type,
             };
-            // Add cache control if present
             if (block.cache_control) {
               docPart.providerOptions = {
                 anthropic: {
@@ -620,14 +565,12 @@ function buildSystemContent(
     return system;
   }
 
-  // Handle array of system content blocks with cache control
   return system.map((block) => {
     const content: any = {
       type: 'text',
       text: block.text,
     };
 
-    // Add cache control if present
     if (block.cache_control) {
       content.providerOptions = {
         anthropic: {
@@ -651,7 +594,6 @@ function convertToolsToAISDK(tools: AnthropicTool[]): Record<string, any> {
       parameters: convertJsonSchemaToZod(t.input_schema),
     };
 
-    // Add cache control if present on tool
     if (t.cache_control) {
       toolDef.providerOptions = {
         anthropic: {
@@ -724,7 +666,6 @@ function convertToolChoice(toolChoice: any): any {
 // ==================== Model ID ====================
 
 function normalizeModelId(model: string): string {
-  // Remove any existing prefix and add anthropic/ prefix for gateway
   const cleanModel = model.replace('anthropic/', '');
   return `anthropic/${cleanModel}`;
 }
@@ -762,13 +703,10 @@ async function handleStreamResponse(options: any, originalModel: string): Promis
       );
 
       try {
-        // Process the stream using fullStream
         for await (const part of result.fullStream) {
           switch (part.type) {
             case 'reasoning':
-              // Handle reasoning/thinking blocks
               if (!hasThinkingBlock) {
-                // Start thinking block
                 controller.enqueue(
                   encoder.encode(
                     `event: content_block_start\ndata: ${JSON.stringify({
@@ -792,7 +730,6 @@ async function handleStreamResponse(options: any, originalModel: string): Promis
               break;
 
             case 'text-delta':
-              // If we were in thinking mode, close it first
               if (hasThinkingBlock && !hasStartedTextBlock) {
                 controller.enqueue(
                   encoder.encode(
@@ -806,7 +743,6 @@ async function handleStreamResponse(options: any, originalModel: string): Promis
                 hasThinkingBlock = false;
               }
 
-              // Start text block if not started
               if (!hasStartedTextBlock) {
                 controller.enqueue(
                   encoder.encode(
@@ -832,7 +768,6 @@ async function handleStreamResponse(options: any, originalModel: string): Promis
               break;
 
             case 'tool-call':
-              // Close any open block first
               if (hasStartedTextBlock || hasThinkingBlock) {
                 controller.enqueue(
                   encoder.encode(
@@ -847,7 +782,6 @@ async function handleStreamResponse(options: any, originalModel: string): Promis
                 hasThinkingBlock = false;
               }
 
-              // Start tool use block
               controller.enqueue(
                 encoder.encode(
                   `event: content_block_start\ndata: ${JSON.stringify({
@@ -888,7 +822,6 @@ async function handleStreamResponse(options: any, originalModel: string): Promis
               break;
 
             case 'finish':
-              // Close any open block
               if (hasStartedTextBlock || hasThinkingBlock) {
                 controller.enqueue(
                   encoder.encode(
@@ -900,10 +833,8 @@ async function handleStreamResponse(options: any, originalModel: string): Promis
                 );
               }
 
-              // Get usage from finish event
               const usage = part.usage || { promptTokens: 0, completionTokens: 0 };
 
-              // Send message_delta
               controller.enqueue(
                 encoder.encode(
                   `event: message_delta\ndata: ${JSON.stringify({
@@ -917,7 +848,6 @@ async function handleStreamResponse(options: any, originalModel: string): Promis
                 )
               );
 
-              // Send message_stop
               controller.enqueue(
                 encoder.encode(
                   `event: message_stop\ndata: ${JSON.stringify({
@@ -959,10 +889,8 @@ async function handleStreamResponse(options: any, originalModel: string): Promis
 async function handleNonStreamResponse(options: any, originalModel: string): Promise<Response> {
   const result = await generateText(options);
 
-  // Build Anthropic format response
   const content: ContentBlock[] = [];
 
-  // Add thinking if present (check multiple possible properties)
   const thinkingContent = (result as any).reasoning || (result as any).reasoningText;
   if (thinkingContent) {
     content.push({
@@ -971,7 +899,6 @@ async function handleNonStreamResponse(options: any, originalModel: string): Pro
     });
   }
 
-  // Add text
   if (result.text) {
     content.push({
       type: 'text',
@@ -979,7 +906,6 @@ async function handleNonStreamResponse(options: any, originalModel: string): Pro
     });
   }
 
-  // Add tool calls
   if (result.toolCalls && result.toolCalls.length > 0) {
     for (const toolCall of result.toolCalls) {
       content.push({
@@ -991,7 +917,6 @@ async function handleNonStreamResponse(options: any, originalModel: string): Pro
     }
   }
 
-  // Build response with cache metadata if available
   const response: any = {
     id: `msg_${Date.now()}`,
     type: 'message',
@@ -1006,7 +931,6 @@ async function handleNonStreamResponse(options: any, originalModel: string): Pro
     },
   };
 
-  // Add cache usage if available from provider metadata
   const anthropicMetadata = (result as any).providerMetadata?.anthropic;
   if (anthropicMetadata) {
     if (anthropicMetadata.cacheCreationInputTokens !== undefined) {
