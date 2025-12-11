@@ -1,4 +1,5 @@
-import { createAnthropic } from '@ai-sdk/anthropic';
+import { gateway } from '@ai-sdk/gateway';
+import type { AnthropicProviderOptions } from '@ai-sdk/anthropic';
 import { generateText, streamText, CoreMessage } from 'ai';
 import { z } from 'zod';
 import type {
@@ -53,11 +54,11 @@ export default {
       {
         type: 'error',
         error: {
-          type: 'not_found',
-          message: `Not Found: ${url.pathname}`,
+          type: 'api_error',
+          message: 'Method Not Allowed',
         },
       },
-      { status: 404 }
+      { status: 405 }
     );
   },
 };
@@ -65,13 +66,12 @@ export default {
 // ==================== Main Handler ====================
 
 async function handleMessages(body: AnthropicRequest, env: Env): Promise<Response> {
-  // Initialize Anthropic provider with Vercel AI Gateway
-  const anthropic = createAnthropic({
+  // Initialize Gateway provider with Vercel AI Gateway API Key
+  const gatewayProvider = gateway({
     apiKey: env.VERCEL_AI_GATEWAY_KEY,
-    baseURL: 'https://ai-gateway.vercel.sh/v1/anthropic',
   });
 
-  // Normalize model ID
+  // Normalize model ID to gateway format (anthropic/model-name)
   const modelId = normalizeModelId(body.model);
 
   // Convert messages from Anthropic format to AI SDK format (with cache control)
@@ -93,12 +93,12 @@ async function handleMessages(body: AnthropicRequest, env: Env): Promise<Respons
   }
 
   if (Object.keys(anthropicOptions).length > 0) {
-    providerOptions.anthropic = anthropicOptions;
+    providerOptions.anthropic = anthropicOptions satisfies AnthropicProviderOptions;
   }
 
   // Build common options
   const commonOptions: any = {
-    model: anthropic(modelId),
+    model: gatewayProvider.languageModel(modelId),
     messages,
     maxTokens: body.max_tokens,
     temperature: body.temperature,
@@ -351,8 +351,9 @@ function convertToolChoice(toolChoice: any): any {
 // ==================== Model ID ====================
 
 function normalizeModelId(model: string): string {
-  // Remove any existing prefix and normalize
-  return model.replace('anthropic/', '');
+  // Remove any existing prefix and add anthropic/ prefix for gateway
+  const cleanModel = model.replace('anthropic/', '');
+  return `anthropic/${cleanModel}`;
 }
 
 // ==================== Stream Response ====================
