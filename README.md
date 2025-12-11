@@ -1,234 +1,147 @@
 # Claude Code Vercel Proxy
 
-一个 Cloudflare Worker 代理，让 Claude Code 能够使用 Vercel AI Gateway（每月 $5 免费额度）。
+一个运行在 Cloudflare Workers 上的代理服务，将 Anthropic API 请求转发到 Vercel AI Gateway。
 
-## 功能特性
+## ✨ 特性
 
-- ✅ **完整的 Anthropic API 兼容** - 与 Claude Code 无缝配合
-- ✅ **Extended Thinking** - 完整支持 Claude 的思考模式
-- ✅ **图像输入** - 支持 base64 图像
-- ✅ **工具调用** - 完整的 tool use 支持
-- ✅ **流式输出** - 实时 SSE 流式响应
-- ✅ **PDF 文档** - 文档输入支持
-- ✅ **System Prompt** - 完整的系统提示支持
-- ✅ **Cache Control** - 完整的缓存控制支持
-- ✅ **免费部署** - Cloudflare Workers 免费套餐
+- 🔄 **多 Key 负载均衡** - 支持多个 Vercel AI Gateway Key，自动轮询
+- 💰 **额度耗尽自动切换** - Key 额度用完自动切换到下一个
+- 📅 **每月自动重置** - 每月15日自动重置被禁用的 Key
+- 🧠 **Extended Thinking** - 完整支持 Claude 的深度思考功能
+- 🛠 **工具调用** - 支持 tool_use 和 tool_result
+- 📄 **多模态输入** - 支持图片和 PDF 文档
+- 💾 **缓存控制** - 支持 Anthropic 的 cache_control 功能
+- 🌊 **流式输出** - 完整的 SSE 流式响应支持
 
-## 架构
+## 🚀 部署指南
 
-```
-Claude Code CLI          CF Worker                 Vercel AI Gateway
-(Anthropic API)          (This Proxy)              (AI SDK)
-      │                       │                          │
-      │  POST /v1/messages    │                          │
-      │  {                    │                          │
-      │    thinking: {...}    │    @ai-sdk/anthropic     │
-      │    tools: [...] ────────► providerOptions ─────────► Claude
-      │    messages: [...]    │    generateText()        │
-      │    cache_control      │    streamText()          │
-      │  }                    │                          │
-      │                       │                          │
-      │ ◀─────────────────────│◀─────────────────────────│
-      │  Anthropic SSE format │    Convert response      │
-```
-
-## 快速开始
-
-### 1. 克隆仓库
+### 1. 创建 KV 命名空间
 
 ```bash
-git clone https://github.com/ban-shao/claude-code-vercel-proxy.git
-cd claude-code-vercel-proxy
+# 创建 KV 命名空间用于存储 Key 状态
+npx wrangler kv:namespace create KEY_STATUS
 ```
 
-### 2. 安装依赖
+这会输出类似：
+```
+🌀 Creating namespace with title "claude-code-vercel-proxy-KEY_STATUS"
+✨ Success!
+Add the following to your configuration file in your kv_namespaces array:
+[[kv_namespaces]]
+binding = "KEY_STATUS"
+id = "xxxxxxxxxxxxxxxxxxxx"
+```
+
+### 2. 更新 wrangler.toml
+
+将上面输出的 `id` 替换到 `wrangler.toml` 中：
+
+```toml
+[[kv_namespaces]]
+binding = "KEY_STATUS"
+id = "你的实际KV命名空间ID"
+```
+
+### 3. 配置 API Keys
+
+```bash
+# 添加多个 Key（用逗号分隔）
+npx wrangler secret put VERCEL_AI_GATEWAY_KEYS
+# 输入: key1,key2,key3,key4
+```
+
+### 4. 部署
 
 ```bash
 npm install
-```
-
-### 3. 配置 Vercel AI Gateway API Key
-
-```bash
-# 设置为 Cloudflare secret
-npx wrangler secret put VERCEL_AI_GATEWAY_KEY
-# 根据提示输入你的 vck_xxx key
-```
-
-### 4. 部署到 Cloudflare Workers
-
-```bash
 npm run deploy
 ```
 
-### 5. 配置 Claude Code
+## 📖 使用方式
+
+### 基本请求
 
 ```bash
-# 设置环境变量
-export ANTHROPIC_BASE_URL="https://claude-code-vercel-proxy.<your-account>.workers.dev"
-export ANTHROPIC_API_KEY="dummy"  # 代理不验证此值
-
-# 启动 Claude Code
-claude
+curl https://your-worker.workers.dev/v1/messages \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: any" \
+  -H "anthropic-version: 2023-06-01" \
+  -d '{
+    "model": "claude-sonnet-4-20250514",
+    "max_tokens": 1024,
+    "messages": [{"role": "user", "content": "Hello!"}]
+  }'
 ```
 
-## 配置说明
-
-### Cloudflare Workers 环境变量
-
-| 变量 | 说明 | 必需 |
-|------|------|------|
-| `VERCEL_AI_GATEWAY_KEY` | 你的 Vercel AI Gateway API key (vck_xxx) | 是 |
-
-### Claude Code 环境变量
-
-| 变量 | 说明 |
-|------|------|
-| `ANTHROPIC_BASE_URL` | 你部署的 worker URL |
-| `ANTHROPIC_API_KEY` | 任意值（不会被验证） |
-
-## 本地开发
+### Extended Thinking
 
 ```bash
-# 启动本地开发服务器
-npm run dev
-
-# 代理将在 http://localhost:8787 运行
+curl https://your-worker.workers.dev/v1/messages \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: any" \
+  -H "anthropic-version: 2023-06-01" \
+  -d '{
+    "model": "claude-sonnet-4-20250514",
+    "max_tokens": 16000,
+    "thinking": {
+      "type": "enabled",
+      "budget_tokens": 10000
+    },
+    "messages": [{"role": "user", "content": "Solve this complex problem..."}]
+  }'
 ```
 
-## API 兼容性
+### 健康检查（查看 Key 状态）
 
-### 支持的端点
-
-| 端点 | 方法 | 说明 |
-|------|------|------|
-| `/v1/messages` | POST | 主聊天完成端点 |
-
-### 功能支持
-
-| 功能 | Anthropic 格式 | 状态 |
-|------|---------------|------|
-| 基础对话 | `messages` | ✅ 完整 |
-| 流式输出 | `stream: true` | ✅ 完整 |
-| Extended Thinking | `thinking.type/budget_tokens` | ✅ 完整 |
-| 图像输入 | `image` content blocks | ✅ 完整 |
-| 工具调用 | `tools` + `tool_choice` | ✅ 完整 |
-| 工具结果 | `tool_result` content blocks | ✅ 完整 |
-| System Prompt | `system` | ✅ 完整 |
-| PDF 文档 | `document` content blocks | ✅ 完整 |
-| 缓存控制 | `cache_control` | ✅ 完整 |
-
-## 工作原理
-
-1. **接收** Claude Code 发送的 Anthropic 格式请求
-2. **转换** 请求为 Vercel AI SDK 格式
-3. **调用** Vercel AI Gateway，使用正确的 `providerOptions`
-4. **转换** 响应回 Anthropic SSE 格式
-5. **返回** 响应给 Claude Code
-
-### 关键转换：Extended Thinking
-
-```typescript
-// Claude Code 发送的格式 (Anthropic)
-{
-  "thinking": {
-    "type": "enabled",
-    "budget_tokens": 10000
-  }
-}
-
-// 转换为 Vercel AI SDK 格式
-{
-  providerOptions: {
-    anthropic: {
-      thinking: {
-        type: 'enabled',
-        budgetTokens: 10000
-      }
-    }
-  }
-}
+```bash
+curl https://your-worker.workers.dev/health
 ```
 
-### 关键转换：Cache Control
-
-```typescript
-// Claude Code 发送的格式 (Anthropic)
-{
-  "system": [
-    {
-      "type": "text",
-      "text": "You are a helpful assistant.",
-      "cache_control": { "type": "ephemeral" }
-    }
-  ]
-}
-
-// 转换为 Vercel AI SDK 格式
-{
-  system: [
-    {
-      type: 'text',
-      text: 'You are a helpful assistant.',
-      providerOptions: {
-        anthropic: {
-          cacheControl: { type: 'ephemeral' }
-        }
-      }
-    }
-  ]
-}
-```
-
-## 故障排除
-
-### "thinking requires a budget" 错误
-
-确保使用正确的 thinking 格式：
+返回：
 ```json
 {
-  "thinking": {
-    "type": "enabled",
-    "budget_tokens": 10000
-  }
+  "status": "ok",
+  "message": "Claude Code Vercel Proxy is running",
+  "keys": {
+    "total": 5,
+    "available": 3,
+    "disabled": 2
+  },
+  "nextReset": "2025-02-15T00:00:00.000Z"
 }
 ```
 
-### 连接被拒绝
+## 🔧 Key 管理机制
 
-1. 检查 worker 是否已部署：`npm run deploy`
-2. 验证 `ANTHROPIC_BASE_URL` 设置正确
-3. 在 Cloudflare Workers 控制台检查错误
+### 负载均衡
 
-### API key 错误
+- 多个 Key 按顺序轮询使用
+- 每次请求自动选择下一个可用的 Key
 
-1. 验证你的 Vercel AI Gateway key 是否有效
-2. 重新运行 `npx wrangler secret put VERCEL_AI_GATEWAY_KEY`
+### 额度耗尽检测
 
-### 缓存不工作
+当检测到以下错误时，Key 会被自动禁用：
+- `quota` / `insufficient` / `exceeded`
+- `billing` / `payment required`
+- `credit` / `balance`
+- `usage limit` / `spending limit`
 
-确保在消息内容块上正确设置了 `cache_control`：
-```json
-{
-  "content": [
-    {
-      "type": "text",
-      "text": "Large content to cache...",
-      "cache_control": { "type": "ephemeral" }
-    }
-  ]
-}
-```
+### 自动重置
 
-## 费用
+- 每月 **15日凌晨 (UTC)** 自动重置所有被禁用的 Key
+- 这与 Vercel 免费额度的月度重置周期对应
 
-- **Cloudflare Workers**: 免费套餐（每天 100,000 请求）
-- **Vercel AI Gateway**: 每月 $5 免费额度
+## 📋 支持的模型
 
-## 许可证
+| 模型 | API Model ID |
+|------|-------------|
+| Claude Opus 4.5 | `claude-opus-4-5-20251101` |
+| Claude Opus 4 | `claude-opus-4-20250514` |
+| Claude Sonnet 4 | `claude-sonnet-4-20250514` |
+| Claude 3.7 Sonnet | `claude-3-7-sonnet-20250219` |
+| Claude 3.5 Sonnet | `claude-3-5-sonnet-20241022` |
+| Claude 3.5 Haiku | `claude-3-5-haiku-20241022` |
+
+## 📄 License
 
 MIT
-
-## 贡献
-
-欢迎 Pull Request！请随时提交 issue 和功能请求。

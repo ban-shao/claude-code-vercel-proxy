@@ -96,8 +96,21 @@ export interface AnthropicError {
   };
 }
 
+// ==================== Key Status ====================
+
+export interface KeyStatus {
+  disabledAt: number;      // Timestamp when key was disabled
+  reason: string;          // Reason for disabling
+  lastResetMonth: number;  // Month when last reset happened (1-12)
+}
+
 // ==================== Environment ====================
 
 export interface Env {
-  VERCEL_AI_GATEWAY_KEY: string;
+  // Multiple keys separated by commas
+  VERCEL_AI_GATEWAY_KEYS: string;
+  // Legacy single key support (fallback)
+  VERCEL_AI_GATEWAY_KEY?: string;
+  // KV namespace for storing key status
+  KEY_STATUS: KVNamespace;
 }

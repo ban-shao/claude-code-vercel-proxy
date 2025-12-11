@@ -8,7 +8,193 @@ import type {
   ContentBlock,
   AnthropicTool,
   Env,
+  KeyStatus,
 } from './types';
+
+// ==================== Key Management ====================
+
+class KeyManager {
+  private keys: string[];
+  private currentIndex: number = 0;
+  private env: Env;
+
+  constructor(env: Env) {
+    this.env = env;
+    // Support both new multi-key and legacy single key
+    const keysString = env.VERCEL_AI_GATEWAY_KEYS || env.VERCEL_AI_GATEWAY_KEY || '';
+    this.keys = keysString
+      .split(',')
+      .map((k) => k.trim())
+      .filter((k) => k.length > 0);
+
+    if (this.keys.length === 0) {
+      throw new Error('No API keys configured');
+    }
+
+    console.log(`Loaded ${this.keys.length} API key(s)`);
+  }
+
+  // Get KV key for storing status
+  private getKVKey(apiKey: string): string {
+    // Use hash of the key to avoid storing actual key
+    const hash = this.simpleHash(apiKey);
+    return `key_status_${hash}`;
+  }
+
+  // Simple hash function for key identification
+  private simpleHash(str: string): string {
+    let hash = 0;
+    for (let i = 0; i < str.length; i++) {
+      const char = str.charCodeAt(i);
+      hash = ((hash << 5) - hash) + char;
+      hash = hash & hash; // Convert to 32bit integer
+    }
+    return Math.abs(hash).toString(16);
+  }
+
+  // Check if we should reset disabled keys (15th of each month)
+  private shouldResetKeys(): { shouldReset: boolean; currentMonth: number } {
+    const now = new Date();
+    const day = now.getUTCDate();
+    const month = now.getUTCMonth() + 1; // 1-12
+    
+    // Reset on or after the 15th of each month
+    return {
+      shouldReset: day >= 15,
+      currentMonth: month,
+    };
+  }
+
+  // Check if a key is disabled
+  async isKeyDisabled(apiKey: string): Promise<boolean> {
+    try {
+      const kvKey = this.getKVKey(apiKey);
+      const statusJson = await this.env.KEY_STATUS.get(kvKey);
+      
+      if (!statusJson) {
+        return false;
+      }
+
+      const status: KeyStatus = JSON.parse(statusJson);
+      const { shouldReset, currentMonth } = this.shouldResetKeys();
+
+      // If it's past the 15th and this key was disabled in a previous month, reset it
+      if (shouldReset && status.lastResetMonth !== currentMonth) {
+        console.log(`Resetting key (hash: ${this.simpleHash(apiKey)}) - new month reset`);
+        await this.env.KEY_STATUS.delete(kvKey);
+        return false;
+      }
+
+      return true;
+    } catch (error) {
+      console.error('Error checking key status:', error);
+      return false; // Assume key is valid if KV fails
+    }
+  }
+
+  // Mark a key as disabled due to quota exhaustion
+  async disableKey(apiKey: string, reason: string): Promise<void> {
+    try {
+      const kvKey = this.getKVKey(apiKey);
+      const { currentMonth } = this.shouldResetKeys();
+      
+      const status: KeyStatus = {
+        disabledAt: Date.now(),
+        reason: reason,
+        lastResetMonth: currentMonth,
+      };
+
+      // Store with expiration of 35 days (ensures it lasts until next reset)
+      await this.env.KEY_STATUS.put(kvKey, JSON.stringify(status), {
+        expirationTtl: 35 * 24 * 60 * 60, // 35 days in seconds
+      });
+
+      console.log(`Disabled key (hash: ${this.simpleHash(apiKey)}) - reason: ${reason}`);
+    } catch (error) {
+      console.error('Error disabling key:', error);
+    }
+  }
+
+  // Check if error indicates quota exhaustion
+  isQuotaError(error: any): boolean {
+    const errorMessage = error?.message?.toLowerCase() || '';
+    const errorType = error?.type?.toLowerCase() || '';
+    
+    const quotaKeywords = [
+      'quota',
+      'insufficient',
+      'exceeded',
+      'limit reached',
+      'billing',
+      'payment required',
+      'credit',
+      'balance',
+      'usage limit',
+      'spending limit',
+    ];
+
+    return quotaKeywords.some(
+      (keyword) => errorMessage.includes(keyword) || errorType.includes(keyword)
+    );
+  }
+
+  // Get next available key
+  async getNextAvailableKey(): Promise<string | null> {
+    const totalKeys = this.keys.length;
+    let attempts = 0;
+
+    while (attempts < totalKeys) {
+      const key = this.keys[this.currentIndex];
+      this.currentIndex = (this.currentIndex + 1) % totalKeys;
+
+      if (!(await this.isKeyDisabled(key))) {
+        return key;
+      }
+
+      attempts++;
+    }
+
+    return null; // All keys are disabled
+  }
+
+  // Get all keys (for trying multiple on error)
+  async getAvailableKeys(): Promise<string[]> {
+    const available: string[] = [];
+    
+    for (const key of this.keys) {
+      if (!(await this.isKeyDisabled(key))) {
+        available.push(key);
+      }
+    }
+
+    // Rotate starting point for load balancing
+    if (available.length > 1) {
+      const rotateCount = this.currentIndex % available.length;
+      return [...available.slice(rotateCount), ...available.slice(0, rotateCount)];
+    }
+
+    return available;
+  }
+
+  // Get status summary
+  async getStatus(): Promise<{ total: number; available: number; disabled: number }> {
+    let disabled = 0;
+    
+    for (const key of this.keys) {
+      if (await this.isKeyDisabled(key)) {
+        disabled++;
+      }
+    }
+
+    return {
+      total: this.keys.length,
+      available: this.keys.length - disabled,
+      disabled,
+    };
+  }
+}
+
+// ==================== Main Export ====================
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -19,22 +205,45 @@ export default {
       return new Response(null, {
         headers: {
           'Access-Control-Allow-Origin': '*',
-          'Access-Control-Allow-Methods': 'POST, OPTIONS',
+          'Access-Control-Allow-Methods': 'POST, GET, OPTIONS',
           'Access-Control-Allow-Headers': 'Content-Type, Authorization, anthropic-version, x-api-key',
         },
       });
     }
 
-    // Health check
+    // Initialize key manager
+    let keyManager: KeyManager;
+    try {
+      keyManager = new KeyManager(env);
+    } catch (error: any) {
+      return Response.json(
+        {
+          type: 'error',
+          error: {
+            type: 'configuration_error',
+            message: error.message,
+          },
+        },
+        { status: 500 }
+      );
+    }
+
+    // Health check with key status
     if (url.pathname === '/' || url.pathname === '/health') {
-      return Response.json({ status: 'ok', message: 'Claude Code Vercel Proxy is running' });
+      const status = await keyManager.getStatus();
+      return Response.json({
+        status: 'ok',
+        message: 'Claude Code Vercel Proxy is running',
+        keys: status,
+        nextReset: getNextResetDate(),
+      });
     }
 
     // Main endpoint: /v1/messages
     if (url.pathname === '/v1/messages' && request.method === 'POST') {
       try {
         const body = (await request.json()) as AnthropicRequest;
-        return await handleMessages(body, env);
+        return await handleMessagesWithRetry(body, keyManager);
       } catch (error: any) {
         console.error('Error:', error);
         return Response.json(
@@ -63,9 +272,103 @@ export default {
   },
 };
 
+// Get next reset date (15th of current or next month)
+function getNextResetDate(): string {
+  const now = new Date();
+  const year = now.getUTCFullYear();
+  const month = now.getUTCMonth();
+  const day = now.getUTCDate();
+
+  let resetDate: Date;
+  if (day < 15) {
+    // Reset is this month on the 15th
+    resetDate = new Date(Date.UTC(year, month, 15, 0, 0, 0));
+  } else {
+    // Reset is next month on the 15th
+    resetDate = new Date(Date.UTC(year, month + 1, 15, 0, 0, 0));
+  }
+
+  return resetDate.toISOString();
+}
+
+// ==================== Main Handler with Retry ====================
+
+async function handleMessagesWithRetry(
+  body: AnthropicRequest,
+  keyManager: KeyManager
+): Promise<Response> {
+  const availableKeys = await keyManager.getAvailableKeys();
+
+  if (availableKeys.length === 0) {
+    return Response.json(
+      {
+        type: 'error',
+        error: {
+          type: 'quota_exhausted',
+          message: 'All API keys have exhausted their quota. Keys will reset on the 15th of each month.',
+          nextReset: getNextResetDate(),
+        },
+      },
+      { status: 429 }
+    );
+  }
+
+  let lastError: any = null;
+
+  for (const apiKey of availableKeys) {
+    try {
+      console.log(`Trying key (hash: ${apiKey.slice(-8)}...)`);
+      const response = await handleMessages(body, apiKey);
+      
+      // Check if response is an error
+      if (!response.ok) {
+        const errorBody = await response.clone().json().catch(() => null);
+        
+        // Check if it's a quota error
+        if (errorBody?.error && keyManager.isQuotaError(errorBody.error)) {
+          console.log(`Key quota exhausted, disabling and trying next...`);
+          await keyManager.disableKey(apiKey, errorBody.error.message || 'Quota exhausted');
+          lastError = errorBody.error;
+          continue; // Try next key
+        }
+        
+        // For non-quota errors, return the response as-is
+        return response;
+      }
+
+      return response;
+    } catch (error: any) {
+      console.error(`Error with key:`, error.message);
+      
+      // Check if it's a quota error
+      if (keyManager.isQuotaError(error)) {
+        await keyManager.disableKey(apiKey, error.message || 'Quota exhausted');
+        lastError = error;
+        continue; // Try next key
+      }
+
+      // For non-quota errors, throw immediately
+      throw error;
+    }
+  }
+
+  // All keys failed with quota errors
+  return Response.json(
+    {
+      type: 'error',
+      error: {
+        type: 'quota_exhausted',
+        message: lastError?.message || 'All API keys have exhausted their quota.',
+        nextReset: getNextResetDate(),
+      },
+    },
+    { status: 429 }
+  );
+}
+
 // ==================== Main Handler ====================
 
-async function handleMessages(body: AnthropicRequest, env: Env): Promise<Response> {
+async function handleMessages(body: AnthropicRequest, apiKey: string): Promise<Response> {
   // Normalize model ID to gateway format (anthropic/model-name)
   const modelId = normalizeModelId(body.model);
 
@@ -92,9 +395,8 @@ async function handleMessages(body: AnthropicRequest, env: Env): Promise<Respons
   }
 
   // Create gateway instance with API key using createGateway
-  // This is the correct way to configure authentication
   const gateway = createGateway({
-    apiKey: env.VERCEL_AI_GATEWAY_KEY,
+    apiKey: apiKey,
   });
 
   // Get model from gateway
