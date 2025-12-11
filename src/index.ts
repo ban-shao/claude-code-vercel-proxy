@@ -55,10 +55,10 @@ export default {
         type: 'error',
         error: {
           type: 'api_error',
-          message: 'Method Not Allowed',
+          message: 'Not Found',
         },
       },
-      { status: 405 }
+      { status: 404 }
     );
   },
 };
@@ -66,11 +66,6 @@ export default {
 // ==================== Main Handler ====================
 
 async function handleMessages(body: AnthropicRequest, env: Env): Promise<Response> {
-  // Initialize Gateway provider with Vercel AI Gateway API Key
-  const gatewayProvider = gateway({
-    apiKey: env.VERCEL_AI_GATEWAY_KEY,
-  });
-
   // Normalize model ID to gateway format (anthropic/model-name)
   const modelId = normalizeModelId(body.model);
 
@@ -96,9 +91,15 @@ async function handleMessages(body: AnthropicRequest, env: Env): Promise<Respons
     providerOptions.anthropic = anthropicOptions satisfies AnthropicProviderOptions;
   }
 
+  // Create gateway model with API key
+  // The gateway() function directly returns a model that can be used with generateText/streamText
+  const model = gateway(modelId, {
+    apiKey: env.VERCEL_AI_GATEWAY_KEY,
+  });
+
   // Build common options
   const commonOptions: any = {
-    model: gatewayProvider.languageModel(modelId),
+    model,
     messages,
     maxTokens: body.max_tokens,
     temperature: body.temperature,
