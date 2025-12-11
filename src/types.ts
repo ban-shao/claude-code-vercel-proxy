@@ -23,6 +23,11 @@ export interface AnthropicMessage {
   content: string | ContentBlock[];
 }
 
+export interface CacheControl {
+  type: 'ephemeral';
+  ttl?: string; // e.g., '1h' for 1 hour
+}
+
 export interface ContentBlock {
   type: 'text' | 'image' | 'tool_use' | 'tool_result' | 'thinking' | 'document';
   text?: string;
@@ -38,18 +43,20 @@ export interface ContentBlock {
   tool_use_id?: string;
   content?: string | ContentBlock[];
   is_error?: boolean;
+  cache_control?: CacheControl;
 }
 
 export interface SystemContent {
   type: 'text';
   text: string;
-  cache_control?: { type: 'ephemeral' };
+  cache_control?: CacheControl;
 }
 
 export interface AnthropicTool {
   name: string;
   description: string;
   input_schema: JsonSchema;
+  cache_control?: CacheControl;
 }
 
 export interface JsonSchema {
@@ -76,6 +83,8 @@ export interface AnthropicResponse {
   usage: {
     input_tokens: number;
     output_tokens: number;
+    cache_creation_input_tokens?: number;
+    cache_read_input_tokens?: number;
   };
 }
 
