@@ -1,4 +1,4 @@
-import { createAnthropic } from '@ai-sdk/anthropic';
+import { createOpenAI } from '@ai-sdk/openai';
 import { generateText, streamText, CoreMessage } from 'ai';
 import { z } from 'zod';
 import type {
@@ -24,12 +24,18 @@ export default {
       });
     }
 
+    // Health check
+    if (url.pathname === '/' || url.pathname === '/health') {
+      return Response.json({ status: 'ok', message: 'Claude Code Vercel Proxy is running' });
+    }
+
     // Main endpoint: /v1/messages
     if (url.pathname === '/v1/messages' && request.method === 'POST') {
       try {
         const body = (await request.json()) as AnthropicRequest;
         return await handleMessages(body, env);
       } catch (error: any) {
+        console.error('Error:', error);
         return Response.json(
           {
             type: 'error',
@@ -43,49 +49,75 @@ export default {
       }
     }
 
-    return new Response('Not Found', { status: 404 });
+    return Response.json(
+      {
+        type: 'error',
+        error: {
+          type: 'not_found',
+          message: `Not Found: ${url.pathname}`,
+        },
+      },
+      { status: 404 }
+    );
   },
 };
 
 // ==================== Main Handler ====================
 
 async function handleMessages(body: AnthropicRequest, env: Env): Promise<Response> {
-  // Initialize Anthropic provider via Vercel AI Gateway
-  const provider = createAnthropic({
+  // Initialize OpenAI-compatible provider for Vercel AI Gateway
+  const gateway = createOpenAI({
     apiKey: env.VERCEL_AI_GATEWAY_KEY,
-    baseURL: 'https://ai-gateway.vercel.sh/anthropic/v1',
+    baseURL: 'https://ai-gateway.vercel.sh/v1',
   });
 
-  // Convert messages
-  const messages = convertMessages(body.messages);
+  // Convert messages from Anthropic format to OpenAI format
+  const messages = convertMessagesToOpenAI(body.messages);
 
-  // Build provider options (for thinking, etc.)
-  const providerOptions = buildProviderOptions(body);
+  // Build model ID with anthropic prefix for Vercel AI Gateway
+  const modelId = `anthropic/${normalizeModelId(body.model)}`;
 
-  // Convert tools
-  const tools = body.tools ? convertTools(body.tools) : undefined;
+  // Convert tools to OpenAI format
+  const tools = body.tools ? convertToolsToOpenAI(body.tools) : undefined;
 
   // Handle system prompt
-  const system =
-    typeof body.system === 'string'
-      ? body.system
-      : body.system?.map((s) => s.text).join('\n');
+  const systemMessage = buildSystemMessage(body.system);
+  if (systemMessage) {
+    messages.unshift(systemMessage);
+  }
 
-  const modelId = normalizeModelId(body.model);
+  // Build options - Vercel AI Gateway uses 'reasoning' parameter
+  const extraBody: any = {};
+  if (body.thinking?.type === 'enabled') {
+    extraBody.reasoning = {
+      effort: 'high',
+      budget_tokens: body.thinking.budget_tokens || 10000,
+    };
+  }
 
-  const commonOptions = {
-    model: provider(modelId),
+  const commonOptions: any = {
+    model: gateway(modelId),
     messages,
-    system,
     maxTokens: body.max_tokens,
     temperature: body.temperature,
     topP: body.top_p,
-    topK: body.top_k,
     stopSequences: body.stop_sequences,
-    tools,
-    toolChoice: body.tool_choice ? convertToolChoice(body.tool_choice) : undefined,
-    providerOptions,
   };
+
+  // Add tools if present
+  if (tools && tools.length > 0) {
+    commonOptions.tools = convertToolsToAISDK(body.tools!);
+    if (body.tool_choice) {
+      commonOptions.toolChoice = convertToolChoice(body.tool_choice);
+    }
+  }
+
+  // Add extra body for reasoning
+  if (Object.keys(extraBody).length > 0) {
+    commonOptions.experimental_providerMetadata = {
+      openai: extraBody,
+    };
+  }
 
   if (body.stream) {
     return handleStreamResponse(commonOptions, body.model);
@@ -94,12 +126,15 @@ async function handleMessages(body: AnthropicRequest, env: Env): Promise<Respons
   }
 }
 
-// ==================== Message Conversion ====================
+// ==================== Message Conversion (Anthropic -> OpenAI) ====================
 
-function convertMessages(messages: AnthropicMessage[]): CoreMessage[] {
-  return messages.map((msg) => {
+function convertMessagesToOpenAI(messages: AnthropicMessage[]): CoreMessage[] {
+  const result: CoreMessage[] = [];
+
+  for (const msg of messages) {
     if (typeof msg.content === 'string') {
-      return { role: msg.role, content: msg.content };
+      result.push({ role: msg.role, content: msg.content });
+      continue;
     }
 
     // Handle complex content blocks
@@ -112,6 +147,7 @@ function convertMessages(messages: AnthropicMessage[]): CoreMessage[] {
           break;
 
         case 'thinking':
+          // Include thinking as text for context
           if (block.thinking) {
             parts.push({ type: 'text', text: block.thinking });
           }
@@ -122,16 +158,6 @@ function convertMessages(messages: AnthropicMessage[]): CoreMessage[] {
             parts.push({
               type: 'image',
               image: `data:${block.source.media_type};base64,${block.source.data}`,
-            });
-          }
-          break;
-
-        case 'document':
-          if (block.source) {
-            parts.push({
-              type: 'file',
-              data: `data:${block.source.media_type};base64,${block.source.data}`,
-              mimeType: block.source.media_type,
             });
           }
           break;
@@ -159,13 +185,40 @@ function convertMessages(messages: AnthropicMessage[]): CoreMessage[] {
       }
     }
 
-    return { role: msg.role, content: parts };
-  }) as CoreMessage[];
+    if (parts.length === 1 && parts[0].type === 'text') {
+      result.push({ role: msg.role, content: parts[0].text });
+    } else if (parts.length > 0) {
+      result.push({ role: msg.role, content: parts });
+    }
+  }
+
+  return result;
+}
+
+function buildSystemMessage(system: string | Array<{ type: string; text: string }> | undefined): CoreMessage | null {
+  if (!system) return null;
+
+  const text = typeof system === 'string'
+    ? system
+    : system.map((s) => s.text).join('\n');
+
+  return { role: 'system', content: text };
 }
 
 // ==================== Tool Conversion ====================
 
-function convertTools(tools: AnthropicTool[]): Record<string, any> {
+function convertToolsToOpenAI(tools: AnthropicTool[]): any[] {
+  return tools.map((t) => ({
+    type: 'function',
+    function: {
+      name: t.name,
+      description: t.description,
+      parameters: t.input_schema,
+    },
+  }));
+}
+
+function convertToolsToAISDK(tools: AnthropicTool[]): Record<string, any> {
   const result: Record<string, any> = {};
 
   for (const t of tools) {
@@ -233,26 +286,13 @@ function convertToolChoice(toolChoice: any): any {
   return 'auto';
 }
 
-// ==================== Provider Options ====================
-
-function buildProviderOptions(body: AnthropicRequest): any {
-  const options: any = { anthropic: {} };
-
-  // Extended Thinking
-  if (body.thinking?.type === 'enabled') {
-    options.anthropic.thinking = {
-      type: 'enabled',
-      budgetTokens: body.thinking.budget_tokens || 10000,
-    };
-  }
-
-  return options;
-}
-
 // ==================== Model ID ====================
 
 function normalizeModelId(model: string): string {
-  return model.replace('anthropic/', '');
+  // Remove any existing prefix and normalize
+  return model
+    .replace('anthropic/', '')
+    .replace('claude-', 'claude-');
 }
 
 // ==================== Stream Response ====================
@@ -390,6 +430,7 @@ async function handleStreamResponse(options: any, originalModel: string): Promis
           )
         );
       } catch (error: any) {
+        console.error('Stream error:', error);
         controller.enqueue(
           encoder.encode(
             `event: error\ndata: ${JSON.stringify({
@@ -422,7 +463,7 @@ async function handleNonStreamResponse(options: any, originalModel: string): Pro
   // Build Anthropic format response
   const content: ContentBlock[] = [];
 
-  // Add thinking if present
+  // Add thinking if present (from reasoning)
   if (result.reasoning) {
     content.push({
       type: 'thinking',
