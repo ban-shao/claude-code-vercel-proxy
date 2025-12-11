@@ -1,4 +1,4 @@
-import { createOpenAI } from '@ai-sdk/openai';
+import { createGateway } from '@ai-sdk/gateway';
 import { generateText, streamText, CoreMessage } from 'ai';
 import { z } from 'zod';
 import type {
@@ -65,36 +65,42 @@ export default {
 // ==================== Main Handler ====================
 
 async function handleMessages(body: AnthropicRequest, env: Env): Promise<Response> {
-  // Initialize OpenAI-compatible provider for Vercel AI Gateway
-  const gateway = createOpenAI({
+  // Initialize Gateway provider for Vercel AI Gateway
+  const gateway = createGateway({
     apiKey: env.VERCEL_AI_GATEWAY_KEY,
-    baseURL: 'https://ai-gateway.vercel.sh/v1',
   });
-
-  // Convert messages from Anthropic format to OpenAI format
-  const messages = convertMessagesToOpenAI(body.messages);
 
   // Build model ID with anthropic prefix for Vercel AI Gateway
   const modelId = `anthropic/${normalizeModelId(body.model)}`;
 
-  // Convert tools to OpenAI format
-  const tools = body.tools ? convertToolsToOpenAI(body.tools) : undefined;
+  // Convert messages from Anthropic format to AI SDK format (with cache control)
+  const messages = convertMessagesToAISDK(body.messages);
 
-  // Handle system prompt
-  const systemMessage = buildSystemMessage(body.system);
-  if (systemMessage) {
-    messages.unshift(systemMessage);
+  // Handle system prompt (with cache control support)
+  const systemMessages = buildSystemMessages(body.system);
+  if (systemMessages.length > 0) {
+    messages.unshift(...systemMessages);
   }
 
-  // Build options - Vercel AI Gateway uses 'reasoning' parameter
-  const extraBody: any = {};
+  // Build provider options for Anthropic
+  const providerOptions: Record<string, any> = {};
+
+  // Configure Anthropic-specific options
+  const anthropicOptions: Record<string, any> = {};
+
+  // Extended Thinking support
   if (body.thinking?.type === 'enabled') {
-    extraBody.reasoning = {
-      effort: 'high',
-      budget_tokens: body.thinking.budget_tokens || 10000,
+    anthropicOptions.thinking = {
+      type: 'enabled',
+      budgetTokens: body.thinking.budget_tokens || 10000,
     };
   }
 
+  if (Object.keys(anthropicOptions).length > 0) {
+    providerOptions.anthropic = anthropicOptions;
+  }
+
+  // Build common options
   const commonOptions: any = {
     model: gateway(modelId),
     messages,
@@ -104,19 +110,17 @@ async function handleMessages(body: AnthropicRequest, env: Env): Promise<Respons
     stopSequences: body.stop_sequences,
   };
 
+  // Add provider options if any
+  if (Object.keys(providerOptions).length > 0) {
+    commonOptions.providerOptions = providerOptions;
+  }
+
   // Add tools if present
-  if (tools && tools.length > 0) {
-    commonOptions.tools = convertToolsToAISDK(body.tools!);
+  if (body.tools && body.tools.length > 0) {
+    commonOptions.tools = convertToolsToAISDK(body.tools);
     if (body.tool_choice) {
       commonOptions.toolChoice = convertToolChoice(body.tool_choice);
     }
-  }
-
-  // Add extra body for reasoning
-  if (Object.keys(extraBody).length > 0) {
-    commonOptions.experimental_providerMetadata = {
-      openai: extraBody,
-    };
   }
 
   if (body.stream) {
@@ -126,9 +130,9 @@ async function handleMessages(body: AnthropicRequest, env: Env): Promise<Respons
   }
 }
 
-// ==================== Message Conversion (Anthropic -> OpenAI) ====================
+// ==================== Message Conversion (Anthropic -> AI SDK with Cache Control) ====================
 
-function convertMessagesToOpenAI(messages: AnthropicMessage[]): CoreMessage[] {
+function convertMessagesToAISDK(messages: AnthropicMessage[]): CoreMessage[] {
   const result: CoreMessage[] = [];
 
   for (const msg of messages) {
@@ -143,22 +147,60 @@ function convertMessagesToOpenAI(messages: AnthropicMessage[]): CoreMessage[] {
     for (const block of msg.content) {
       switch (block.type) {
         case 'text':
-          parts.push({ type: 'text', text: block.text! });
+          const textPart: any = { type: 'text', text: block.text! };
+          // Add cache control if present
+          if (block.cache_control) {
+            textPart.providerOptions = {
+              anthropic: {
+                cacheControl: block.cache_control,
+              },
+            };
+          }
+          parts.push(textPart);
           break;
 
         case 'thinking':
           // Include thinking as text for context
           if (block.thinking) {
-            parts.push({ type: 'text', text: block.thinking });
+            parts.push({ type: 'text', text: `<thinking>${block.thinking}</thinking>` });
           }
           break;
 
         case 'image':
           if (block.source) {
-            parts.push({
+            const imagePart: any = {
               type: 'image',
               image: `data:${block.source.media_type};base64,${block.source.data}`,
-            });
+            };
+            // Add cache control if present
+            if (block.cache_control) {
+              imagePart.providerOptions = {
+                anthropic: {
+                  cacheControl: block.cache_control,
+                },
+              };
+            }
+            parts.push(imagePart);
+          }
+          break;
+
+        case 'document':
+          // Handle PDF documents
+          if (block.source) {
+            const docPart: any = {
+              type: 'file',
+              data: block.source.data,
+              mimeType: block.source.media_type,
+            };
+            // Add cache control if present
+            if (block.cache_control) {
+              docPart.providerOptions = {
+                anthropic: {
+                  cacheControl: block.cache_control,
+                },
+              };
+            }
+            parts.push(docPart);
           }
           break;
 
@@ -185,7 +227,7 @@ function convertMessagesToOpenAI(messages: AnthropicMessage[]): CoreMessage[] {
       }
     }
 
-    if (parts.length === 1 && parts[0].type === 'text') {
+    if (parts.length === 1 && parts[0].type === 'text' && !parts[0].providerOptions) {
       result.push({ role: msg.role, content: parts[0].text });
     } else if (parts.length > 0) {
       result.push({ role: msg.role, content: parts });
@@ -195,37 +237,60 @@ function convertMessagesToOpenAI(messages: AnthropicMessage[]): CoreMessage[] {
   return result;
 }
 
-function buildSystemMessage(system: string | Array<{ type: string; text: string }> | undefined): CoreMessage | null {
-  if (!system) return null;
+function buildSystemMessages(
+  system: string | Array<{ type: string; text: string; cache_control?: { type: string } }> | undefined
+): CoreMessage[] {
+  if (!system) return [];
 
-  const text = typeof system === 'string'
-    ? system
-    : system.map((s) => s.text).join('\n');
+  if (typeof system === 'string') {
+    return [{ role: 'system', content: system }];
+  }
 
-  return { role: 'system', content: text };
+  // Handle array of system content blocks with cache control
+  const systemMessages: CoreMessage[] = [];
+
+  for (const block of system) {
+    const message: any = {
+      role: 'system',
+      content: block.text,
+    };
+
+    // Add cache control if present
+    if (block.cache_control) {
+      message.providerOptions = {
+        anthropic: {
+          cacheControl: block.cache_control,
+        },
+      };
+    }
+
+    systemMessages.push(message);
+  }
+
+  return systemMessages;
 }
 
 // ==================== Tool Conversion ====================
-
-function convertToolsToOpenAI(tools: AnthropicTool[]): any[] {
-  return tools.map((t) => ({
-    type: 'function',
-    function: {
-      name: t.name,
-      description: t.description,
-      parameters: t.input_schema,
-    },
-  }));
-}
 
 function convertToolsToAISDK(tools: AnthropicTool[]): Record<string, any> {
   const result: Record<string, any> = {};
 
   for (const t of tools) {
-    result[t.name] = {
+    const toolDef: any = {
       description: t.description,
       parameters: convertJsonSchemaToZod(t.input_schema),
     };
+
+    // Add cache control if present on tool
+    if (t.cache_control) {
+      toolDef.providerOptions = {
+        anthropic: {
+          cacheControl: t.cache_control,
+        },
+      };
+    }
+
+    result[t.name] = toolDef;
   }
 
   return result;
@@ -290,19 +355,18 @@ function convertToolChoice(toolChoice: any): any {
 
 function normalizeModelId(model: string): string {
   // Remove any existing prefix and normalize
-  return model
-    .replace('anthropic/', '')
-    .replace('claude-', 'claude-');
+  return model.replace('anthropic/', '');
 }
 
 // ==================== Stream Response ====================
 
 async function handleStreamResponse(options: any, originalModel: string): Promise<Response> {
-  const result = await streamText(options);
+  const result = streamText(options);
 
   const encoder = new TextEncoder();
   const messageId = `msg_${Date.now()}`;
   let contentBlockIndex = 0;
+  let hasThinkingBlock = false;
 
   const stream = new ReadableStream({
     async start(controller) {
@@ -326,109 +390,178 @@ async function handleStreamResponse(options: any, originalModel: string): Promis
       );
 
       try {
-        // Start text content block
-        controller.enqueue(
-          encoder.encode(
-            `event: content_block_start\ndata: ${JSON.stringify({
-              type: 'content_block_start',
-              index: contentBlockIndex,
-              content_block: { type: 'text', text: '' },
-            })}\n\n`
-          )
-        );
+        // Check if we have reasoning/thinking in the result
+        const resultPromise = result;
 
-        // Stream text
-        for await (const chunk of result.textStream) {
-          controller.enqueue(
-            encoder.encode(
-              `event: content_block_delta\ndata: ${JSON.stringify({
-                type: 'content_block_delta',
-                index: contentBlockIndex,
-                delta: { type: 'text_delta', text: chunk },
-              })}\n\n`
-            )
-          );
-        }
+        // Process the stream
+        for await (const part of resultPromise.fullStream) {
+          switch (part.type) {
+            case 'reasoning':
+              // Handle reasoning/thinking blocks
+              if (!hasThinkingBlock) {
+                // Start thinking block
+                controller.enqueue(
+                  encoder.encode(
+                    `event: content_block_start\ndata: ${JSON.stringify({
+                      type: 'content_block_start',
+                      index: contentBlockIndex,
+                      content_block: { type: 'thinking', thinking: '' },
+                    })}\n\n`
+                  )
+                );
+                hasThinkingBlock = true;
+              }
+              controller.enqueue(
+                encoder.encode(
+                  `event: content_block_delta\ndata: ${JSON.stringify({
+                    type: 'content_block_delta',
+                    index: contentBlockIndex,
+                    delta: { type: 'thinking_delta', thinking: part.textDelta },
+                  })}\n\n`
+                )
+              );
+              break;
 
-        controller.enqueue(
-          encoder.encode(
-            `event: content_block_stop\ndata: ${JSON.stringify({
-              type: 'content_block_stop',
-              index: contentBlockIndex,
-            })}\n\n`
-          )
-        );
+            case 'text-delta':
+              // If we were in thinking mode, close it first
+              if (hasThinkingBlock) {
+                controller.enqueue(
+                  encoder.encode(
+                    `event: content_block_stop\ndata: ${JSON.stringify({
+                      type: 'content_block_stop',
+                      index: contentBlockIndex,
+                    })}\n\n`
+                  )
+                );
+                contentBlockIndex++;
+                hasThinkingBlock = false;
 
-        // Handle tool calls if any
-        const toolCalls = await result.toolCalls;
-        if (toolCalls && toolCalls.length > 0) {
-          for (const toolCall of toolCalls) {
-            contentBlockIndex++;
-            controller.enqueue(
-              encoder.encode(
-                `event: content_block_start\ndata: ${JSON.stringify({
-                  type: 'content_block_start',
-                  index: contentBlockIndex,
-                  content_block: {
-                    type: 'tool_use',
-                    id: toolCall.toolCallId,
-                    name: toolCall.toolName,
-                    input: {},
-                  },
-                })}\n\n`
-              )
-            );
+                // Start text block
+                controller.enqueue(
+                  encoder.encode(
+                    `event: content_block_start\ndata: ${JSON.stringify({
+                      type: 'content_block_start',
+                      index: contentBlockIndex,
+                      content_block: { type: 'text', text: '' },
+                    })}\n\n`
+                  )
+                );
+              } else if (contentBlockIndex === 0) {
+                // First text block
+                controller.enqueue(
+                  encoder.encode(
+                    `event: content_block_start\ndata: ${JSON.stringify({
+                      type: 'content_block_start',
+                      index: contentBlockIndex,
+                      content_block: { type: 'text', text: '' },
+                    })}\n\n`
+                  )
+                );
+              }
 
-            controller.enqueue(
-              encoder.encode(
-                `event: content_block_delta\ndata: ${JSON.stringify({
-                  type: 'content_block_delta',
-                  index: contentBlockIndex,
-                  delta: {
-                    type: 'input_json_delta',
-                    partial_json: JSON.stringify(toolCall.args),
-                  },
-                })}\n\n`
-              )
-            );
+              controller.enqueue(
+                encoder.encode(
+                  `event: content_block_delta\ndata: ${JSON.stringify({
+                    type: 'content_block_delta',
+                    index: contentBlockIndex,
+                    delta: { type: 'text_delta', text: part.textDelta },
+                  })}\n\n`
+                )
+              );
+              break;
 
-            controller.enqueue(
-              encoder.encode(
-                `event: content_block_stop\ndata: ${JSON.stringify({
-                  type: 'content_block_stop',
-                  index: contentBlockIndex,
-                })}\n\n`
-              )
-            );
+            case 'tool-call':
+              // Close any open block
+              if (contentBlockIndex >= 0) {
+                controller.enqueue(
+                  encoder.encode(
+                    `event: content_block_stop\ndata: ${JSON.stringify({
+                      type: 'content_block_stop',
+                      index: contentBlockIndex,
+                    })}\n\n`
+                  )
+                );
+              }
+              contentBlockIndex++;
+
+              // Start tool use block
+              controller.enqueue(
+                encoder.encode(
+                  `event: content_block_start\ndata: ${JSON.stringify({
+                    type: 'content_block_start',
+                    index: contentBlockIndex,
+                    content_block: {
+                      type: 'tool_use',
+                      id: part.toolCallId,
+                      name: part.toolName,
+                      input: {},
+                    },
+                  })}\n\n`
+                )
+              );
+
+              controller.enqueue(
+                encoder.encode(
+                  `event: content_block_delta\ndata: ${JSON.stringify({
+                    type: 'content_block_delta',
+                    index: contentBlockIndex,
+                    delta: {
+                      type: 'input_json_delta',
+                      partial_json: JSON.stringify(part.args),
+                    },
+                  })}\n\n`
+                )
+              );
+
+              controller.enqueue(
+                encoder.encode(
+                  `event: content_block_stop\ndata: ${JSON.stringify({
+                    type: 'content_block_stop',
+                    index: contentBlockIndex,
+                  })}\n\n`
+                )
+              );
+              break;
+
+            case 'finish':
+              // Close any open block
+              controller.enqueue(
+                encoder.encode(
+                  `event: content_block_stop\ndata: ${JSON.stringify({
+                    type: 'content_block_stop',
+                    index: contentBlockIndex,
+                  })}\n\n`
+                )
+              );
+
+              // Get usage from finish event
+              const usage = part.usage || { promptTokens: 0, completionTokens: 0 };
+
+              // Send message_delta
+              controller.enqueue(
+                encoder.encode(
+                  `event: message_delta\ndata: ${JSON.stringify({
+                    type: 'message_delta',
+                    delta: {
+                      stop_reason: part.finishReason === 'tool-calls' ? 'tool_use' : 'end_turn',
+                      stop_sequence: null,
+                    },
+                    usage: { output_tokens: usage.completionTokens || 0 },
+                  })}\n\n`
+                )
+              );
+
+              // Send message_stop
+              controller.enqueue(
+                encoder.encode(
+                  `event: message_stop\ndata: ${JSON.stringify({
+                    type: 'message_stop',
+                  })}\n\n`
+                )
+              );
+              break;
           }
         }
-
-        // Get final usage
-        const finalUsage = await result.usage;
-        const outputTokens = finalUsage?.completionTokens || 0;
-
-        // Send message_delta
-        controller.enqueue(
-          encoder.encode(
-            `event: message_delta\ndata: ${JSON.stringify({
-              type: 'message_delta',
-              delta: {
-                stop_reason: toolCalls?.length ? 'tool_use' : 'end_turn',
-                stop_sequence: null,
-              },
-              usage: { output_tokens: outputTokens },
-            })}\n\n`
-          )
-        );
-
-        // Send message_stop
-        controller.enqueue(
-          encoder.encode(
-            `event: message_stop\ndata: ${JSON.stringify({
-              type: 'message_stop',
-            })}\n\n`
-          )
-        );
       } catch (error: any) {
         console.error('Stream error:', error);
         controller.enqueue(
@@ -471,6 +604,14 @@ async function handleNonStreamResponse(options: any, originalModel: string): Pro
     });
   }
 
+  // Also check reasoningText
+  if (result.reasoningText) {
+    content.push({
+      type: 'thinking',
+      thinking: result.reasoningText,
+    });
+  }
+
   // Add text
   if (result.text) {
     content.push({
@@ -491,24 +632,35 @@ async function handleNonStreamResponse(options: any, originalModel: string): Pro
     }
   }
 
-  return Response.json(
-    {
-      id: `msg_${Date.now()}`,
-      type: 'message',
-      role: 'assistant',
-      content,
-      model: originalModel,
-      stop_reason: result.toolCalls?.length ? 'tool_use' : 'end_turn',
-      stop_sequence: null,
-      usage: {
-        input_tokens: result.usage?.promptTokens || 0,
-        output_tokens: result.usage?.completionTokens || 0,
-      },
+  // Build response with cache metadata if available
+  const response: any = {
+    id: `msg_${Date.now()}`,
+    type: 'message',
+    role: 'assistant',
+    content,
+    model: originalModel,
+    stop_reason: result.toolCalls?.length ? 'tool_use' : 'end_turn',
+    stop_sequence: null,
+    usage: {
+      input_tokens: result.usage?.promptTokens || 0,
+      output_tokens: result.usage?.completionTokens || 0,
     },
-    {
-      headers: {
-        'Access-Control-Allow-Origin': '*',
-      },
+  };
+
+  // Add cache usage if available from provider metadata
+  const anthropicMetadata = result.providerMetadata?.anthropic as any;
+  if (anthropicMetadata) {
+    if (anthropicMetadata.cacheCreationInputTokens !== undefined) {
+      response.usage.cache_creation_input_tokens = anthropicMetadata.cacheCreationInputTokens;
     }
-  );
+    if (anthropicMetadata.cacheReadInputTokens !== undefined) {
+      response.usage.cache_read_input_tokens = anthropicMetadata.cacheReadInputTokens;
+    }
+  }
+
+  return Response.json(response, {
+    headers: {
+      'Access-Control-Allow-Origin': '*',
+    },
+  });
 }
