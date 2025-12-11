@@ -186,27 +186,61 @@ function convertMessages(messages: AnthropicMessage[]): CoreMessage[] {
 // ============================================================================
 
 /**
- * Convert system prompt to AI SDK format with cache control support
+ * Check if system prompt has cache control (is array format)
+ */
+function systemHasCacheControl(system: string | SystemContentBlock[] | undefined): boolean {
+  if (!system || typeof system === 'string') return false;
+  return system.some(block => block.cache_control);
+}
+
+/**
+ * Convert system prompt to AI SDK format
+ * Returns either a string for simple system prompts,
+ * or null if it should be handled as system messages in the messages array
  */
 function convertSystemPrompt(
   system: string | SystemContentBlock[] | undefined
-): string | Array<{ type: 'text'; text: string; providerOptions?: any }> | undefined {
+): string | undefined {
   if (!system) return undefined;
 
-  // Simple string
+  // Simple string - use as system property
   if (typeof system === 'string') {
     return system;
   }
 
-  // Array of content blocks with potential cache control
-  return system.map((block) => {
-    const result: any = { type: 'text', text: block.text };
+  // Array without cache control - concatenate to string
+  if (!systemHasCacheControl(system)) {
+    return system.map(block => block.text).join('\n');
+  }
+
+  // Array with cache control - will be handled as messages
+  return undefined;
+}
+
+/**
+ * Convert system prompt with cache control to system messages
+ * These will be prepended to the messages array
+ */
+function convertSystemToMessages(
+  system: string | SystemContentBlock[] | undefined
+): CoreMessage[] {
+  if (!system || typeof system === 'string') return [];
+  if (!systemHasCacheControl(system)) return [];
+
+  // Convert each system block to a system message
+  return system.map((block): CoreMessage => {
+    const message: any = {
+      role: 'system',
+      content: block.text,
+    };
+    
     if (block.cache_control) {
-      result.providerOptions = {
+      message.providerOptions = {
         anthropic: { cacheControl: block.cache_control },
       };
     }
-    return result;
+    
+    return message;
   });
 }
 
@@ -668,10 +702,22 @@ async function handleMessages(request: Request, env: Env): Promise<Response> {
   const model = gateway(modelId);
   const messageId = generateMessageId();
 
+  // Convert messages
+  const convertedMessages = convertMessages(body.messages);
+  
+  // Handle system prompt - check if it needs to be in messages array (for cache control)
+  const systemMessages = convertSystemToMessages(body.system);
+  const systemPrompt = convertSystemPrompt(body.system);
+  
+  // Combine system messages with user messages if needed
+  const allMessages = systemMessages.length > 0 
+    ? [...systemMessages, ...convertedMessages]
+    : convertedMessages;
+
   // Build common options
   const commonOptions: any = {
     model,
-    messages: convertMessages(body.messages),
+    messages: allMessages,
     maxTokens: body.max_tokens,
     temperature: body.temperature,
     topP: body.top_p,
@@ -679,10 +725,9 @@ async function handleMessages(request: Request, env: Env): Promise<Response> {
     stopSequences: body.stop_sequences,
   };
 
-  // Add system prompt if present
-  const system = convertSystemPrompt(body.system);
-  if (system) {
-    commonOptions.system = system;
+  // Add system prompt only if it's a simple string (no cache control)
+  if (systemPrompt) {
+    commonOptions.system = systemPrompt;
   }
 
   // Add tools if present
@@ -739,7 +784,7 @@ export default {
       return jsonResponse({
         status: 'ok',
         service: 'claude-code-vercel-proxy',
-        version: '2.0.1',
+        version: '2.0.2',
         timestamp: new Date().toISOString(),
       });
     }
