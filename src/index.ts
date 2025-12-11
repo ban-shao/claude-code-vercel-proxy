@@ -15,7 +15,8 @@
  */
 
 import { createGateway } from '@ai-sdk/gateway';
-import { streamText, generateText, jsonSchema, type CoreMessage, type CoreTool } from 'ai';
+import { streamText, generateText, tool, type CoreMessage, type CoreTool } from 'ai';
+import { z } from 'zod';
 import type {
   Env,
   AnthropicRequest,
@@ -245,107 +246,101 @@ function convertSystemToMessages(
 }
 
 // ============================================================================
-// Tool Conversion
+// Tool Conversion - Using Zod for AI SDK v5 Compatibility
 // ============================================================================
 
 /**
- * Recursively clean JSON Schema to remove undefined values and ensure compatibility
- * This is critical for AWS Bedrock which is strict about schema format
+ * Convert JSON Schema type to Zod schema
+ * This handles the conversion from Anthropic's JSON Schema format to Zod,
+ * which is the preferred schema format for AI SDK v5
  */
-function cleanJsonSchema(schema: any): any {
-  if (schema === null || schema === undefined) {
-    return undefined;
-  }
-
-  if (Array.isArray(schema)) {
-    return schema.map(item => cleanJsonSchema(item)).filter(item => item !== undefined);
-  }
-
-  if (typeof schema === 'object') {
-    const cleaned: any = {};
-    for (const [key, value] of Object.entries(schema)) {
-      // Skip undefined values
-      if (value === undefined) continue;
-      
-      // Skip $schema field as it's not needed and can cause issues
-      if (key === '$schema') continue;
-      
-      const cleanedValue = cleanJsonSchema(value);
-      if (cleanedValue !== undefined) {
-        cleaned[key] = cleanedValue;
-      }
-    }
-    return Object.keys(cleaned).length > 0 ? cleaned : undefined;
-  }
-
-  return schema;
-}
-
-/**
- * Normalize tool input schema to ensure it has required fields
- * The schema must have type: "object" for the API to accept it
- */
-function normalizeInputSchema(inputSchema: any): any {
-  // If no schema provided, return a minimal valid schema
-  if (!inputSchema) {
-    return {
-      type: 'object',
-      properties: {},
-      required: [],
-    };
-  }
-
-  // Clone and clean the schema
-  const schema = cleanJsonSchema(JSON.parse(JSON.stringify(inputSchema)));
-
-  // Ensure type is exactly the string "object"
+function jsonSchemaToZod(schema: any): z.ZodTypeAny {
   if (!schema || typeof schema !== 'object') {
-    return {
-      type: 'object',
-      properties: {},
-      required: [],
-    };
+    return z.any();
   }
 
-  // Force type to be "object" string
-  schema.type = 'object';
+  const type = schema.type;
+  const description = schema.description;
 
-  // Ensure properties exists and is an object
-  if (!schema.properties || typeof schema.properties !== 'object') {
-    schema.properties = {};
-  }
+  let zodSchema: z.ZodTypeAny;
 
-  // Clean up each property to ensure valid types
-  for (const [propName, propValue] of Object.entries(schema.properties)) {
-    if (propValue && typeof propValue === 'object') {
-      const prop = propValue as any;
-      // Ensure each property has a valid type
-      if (!prop.type) {
-        prop.type = 'string';
+  switch (type) {
+    case 'string': {
+      let strSchema = z.string();
+      if (schema.enum && Array.isArray(schema.enum)) {
+        // Create enum from string literals
+        const enumValues = schema.enum as [string, ...string[]];
+        zodSchema = z.enum(enumValues);
+      } else {
+        zodSchema = strSchema;
       }
+      break;
+    }
+
+    case 'number':
+    case 'integer': {
+      zodSchema = z.number();
+      break;
+    }
+
+    case 'boolean': {
+      zodSchema = z.boolean();
+      break;
+    }
+
+    case 'array': {
+      const itemSchema = schema.items ? jsonSchemaToZod(schema.items) : z.any();
+      zodSchema = z.array(itemSchema);
+      break;
+    }
+
+    case 'object': {
+      const properties = schema.properties || {};
+      const required = schema.required || [];
+      
+      const shape: Record<string, z.ZodTypeAny> = {};
+      
+      for (const [propName, propSchema] of Object.entries(properties)) {
+        let propZod = jsonSchemaToZod(propSchema as any);
+        
+        // Make optional if not in required array
+        if (!required.includes(propName)) {
+          propZod = propZod.optional();
+        }
+        
+        shape[propName] = propZod;
+      }
+      
+      zodSchema = z.object(shape);
+      break;
+    }
+
+    case 'null': {
+      zodSchema = z.null();
+      break;
+    }
+
+    default: {
+      // For unknown types or missing type, use any
+      zodSchema = z.any();
     }
   }
 
-  // Ensure required is an array
-  if (!Array.isArray(schema.required)) {
-    schema.required = [];
+  // Add description if present
+  if (description && typeof zodSchema.describe === 'function') {
+    zodSchema = zodSchema.describe(description);
   }
 
-  // Remove additionalProperties if it's undefined or could cause issues
-  if (schema.additionalProperties === undefined) {
-    delete schema.additionalProperties;
-  }
-
-  return schema;
+  return zodSchema;
 }
 
 /**
- * Convert Anthropic tools to AI SDK format
- * Uses jsonSchema() helper for proper compatibility with AI Gateway/Bedrock
+ * Convert Anthropic tools to AI SDK format using tool() helper
  * 
  * AI SDK v5 requires:
- * - inputSchema (not parameters) for tool definitions
- * - jsonSchema() wrapper for JSON Schema objects
+ * - Using tool() helper function
+ * - inputSchema property with Zod schema
+ * - This ensures proper compatibility with AI Gateway/Bedrock
  */
 function convertTools(
   tools: AnthropicTool[] | undefined
@@ -354,37 +349,32 @@ function convertTools(
 
   const result: Record<string, CoreTool> = {};
 
-  for (const tool of tools) {
-    // Normalize the input schema to ensure it has type: "object"
-    const normalizedSchema = normalizeInputSchema(tool.input_schema);
-    
-    // Create the JSON Schema object with explicit type
-    const schemaObject = {
-      type: 'object' as const,
-      properties: normalizedSchema.properties || {},
-      required: normalizedSchema.required || [],
+  for (const anthropicTool of tools) {
+    // Get the input schema or create a default one
+    const inputSchema = anthropicTool.input_schema || {
+      type: 'object',
+      properties: {},
+      required: [],
     };
 
-    // Add additionalProperties only if explicitly defined
-    if (normalizedSchema.additionalProperties !== undefined) {
-      (schemaObject as any).additionalProperties = normalizedSchema.additionalProperties;
-    }
-    
-    // Create tool definition using jsonSchema() helper
-    // This is the key fix - AI SDK v5 requires jsonSchema() wrapper
-    const toolDef: CoreTool = {
-      description: tool.description || '',
-      parameters: jsonSchema(schemaObject),
+    // Ensure the schema has type: 'object' at the root
+    const normalizedSchema = {
+      type: 'object',
+      properties: inputSchema.properties || {},
+      required: inputSchema.required || [],
     };
 
-    // Add provider options for cache control if present
-    if (tool.cache_control) {
-      (toolDef as any).providerOptions = {
-        anthropic: { cacheControl: tool.cache_control },
-      };
-    }
+    // Convert JSON Schema to Zod schema
+    const zodSchema = jsonSchemaToZod(normalizedSchema);
 
-    result[tool.name] = toolDef;
+    // Create tool using the tool() helper - this is the key for AI SDK v5
+    const toolDef = tool({
+      description: anthropicTool.description || '',
+      inputSchema: zodSchema as z.ZodObject<any>,
+      // Note: We don't provide execute function as tools are executed client-side
+    });
+
+    result[anthropicTool.name] = toolDef;
   }
 
   return result;
@@ -891,7 +881,7 @@ export default {
       return jsonResponse({
         status: 'ok',
         service: 'claude-code-vercel-proxy',
-        version: '2.1.0',
+        version: '2.2.0',
         timestamp: new Date().toISOString(),
       });
     }
