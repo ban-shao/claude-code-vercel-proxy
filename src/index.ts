@@ -1,4 +1,4 @@
-import { createGateway } from '@ai-sdk/gateway';
+import { gateway } from '@ai-sdk/gateway';
 import type { AnthropicProviderOptions } from '@ai-sdk/anthropic';
 import { generateText, streamText, CoreMessage } from 'ai';
 import { z } from 'zod';
@@ -132,13 +132,15 @@ async function handleMessages(body: AnthropicRequest, env: Env): Promise<Respons
     providerOptions.anthropic = anthropicOptions satisfies AnthropicProviderOptions;
   }
 
-  // Create gateway instance with API key using createGateway
-  // This is the correct way to configure authentication
-  const gateway = createGateway({
-    apiKey: env.VERCEL_AI_GATEWAY_KEY,
-  });
+  // 设置环境变量供 gateway 使用
+  // Vercel AI Gateway 会自动从环境变量读取 API Key
+  if (env.VERCEL_AI_GATEWAY_API_KEY) {
+    (globalThis as any).process = (globalThis as any).process || { env: {} };
+    (globalThis as any).process.env.VERCEL_AI_GATEWAY_API_KEY = env.VERCEL_AI_GATEWAY_API_KEY;
+  }
 
-  // Get model from gateway
+  // 使用 gateway 函数直接获取模型
+  // gateway 会自动从环境变量读取 API Key
   const model = gateway(modelId);
 
   // Build common options

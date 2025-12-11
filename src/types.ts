@@ -99,5 +99,8 @@ export interface AnthropicError {
 // ==================== Environment ====================
 
 export interface Env {
-  VERCEL_AI_GATEWAY_KEY: string;
+  // Vercel AI Gateway API Key (用于访问 Vercel AI Gateway)
+  VERCEL_AI_GATEWAY_API_KEY: string;
+  // 代理认证 API Key (用于验证客户端请求)
+  PROXY_API_KEY?: string;
 }
