@@ -10,6 +10,37 @@ import type {
   Env,
 } from './types';
 
+// ==================== Authentication ====================
+
+// 验证 API Key - 支持环境变量覆盖，默认为 sk-ant-banshao
+function validateApiKey(request: Request, env: Env): boolean {
+  const apiKey = request.headers.get('x-api-key') || 
+                 request.headers.get('authorization')?.replace('Bearer ', '');
+  
+  // 使用环境变量 PROXY_API_KEY，如果没有设置则使用默认值
+  const validKey = env.PROXY_API_KEY || 'sk-ant-banshao';
+  
+  return apiKey === validKey;
+}
+
+function unauthorizedResponse(): Response {
+  return Response.json(
+    {
+      type: 'error',
+      error: {
+        type: 'authentication_error',
+        message: 'Invalid API key. Please provide a valid x-api-key header.',
+      },
+    },
+    { 
+      status: 401,
+      headers: {
+        'Access-Control-Allow-Origin': '*',
+      },
+    }
+  );
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
@@ -19,19 +50,29 @@ export default {
       return new Response(null, {
         headers: {
           'Access-Control-Allow-Origin': '*',
-          'Access-Control-Allow-Methods': 'POST, OPTIONS',
+          'Access-Control-Allow-Methods': 'POST, GET, OPTIONS',
           'Access-Control-Allow-Headers': 'Content-Type, Authorization, anthropic-version, x-api-key',
         },
       });
     }
 
-    // Health check
+    // Health check (不需要认证)
     if (url.pathname === '/' || url.pathname === '/health') {
-      return Response.json({ status: 'ok', message: 'Claude Code Vercel Proxy is running' });
+      return Response.json({ 
+        status: 'ok', 
+        message: 'Claude Code Vercel Proxy is running',
+        auth: 'required' // 提示需要认证
+      });
     }
 
     // Main endpoint: /v1/messages
     if (url.pathname === '/v1/messages' && request.method === 'POST') {
+      // ⚠️ 验证 API Key
+      if (!validateApiKey(request, env)) {
+        console.log('Authentication failed: Invalid API key');
+        return unauthorizedResponse();
+      }
+
       try {
         const body = (await request.json()) as AnthropicRequest;
         return await handleMessages(body, env);
