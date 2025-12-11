@@ -15,7 +15,7 @@
  */
 
 import { createGateway } from '@ai-sdk/gateway';
-import { streamText, generateText, type CoreMessage, type CoreTool } from 'ai';
+import { streamText, generateText, jsonSchema, type CoreMessage, type CoreTool } from 'ai';
 import type {
   Env,
   AnthropicRequest,
@@ -262,29 +262,25 @@ function normalizeInputSchema(inputSchema: any): any {
     };
   }
 
-  // If schema doesn't have type, add it
-  if (!inputSchema.type) {
-    return {
-      type: 'object',
-      ...inputSchema,
-    };
+  // Clone the schema to avoid mutation
+  const schema = { ...inputSchema };
+
+  // Ensure type is "object"
+  if (!schema.type) {
+    schema.type = 'object';
   }
 
-  // If schema type is not object, wrap it
-  if (inputSchema.type !== 'object') {
-    return {
-      type: 'object',
-      properties: inputSchema.properties || {},
-      required: inputSchema.required || [],
-    };
+  // Ensure properties exists
+  if (!schema.properties) {
+    schema.properties = {};
   }
 
-  // Schema is valid, return as-is
-  return inputSchema;
+  return schema;
 }
 
 /**
  * Convert Anthropic tools to AI SDK format
+ * AI SDK v5 requires using jsonSchema() to wrap raw JSON schemas
  */
 function convertTools(
   tools: AnthropicTool[] | undefined
@@ -297,9 +293,10 @@ function convertTools(
     // Normalize the input schema to ensure it has type: "object"
     const normalizedSchema = normalizeInputSchema(tool.input_schema);
     
+    // AI SDK v5: Use jsonSchema() to wrap raw JSON schemas
     const toolDef: any = {
       description: tool.description || '',
-      parameters: normalizedSchema,
+      parameters: jsonSchema(normalizedSchema),
     };
 
     if (tool.cache_control) {
@@ -822,7 +819,7 @@ export default {
       return jsonResponse({
         status: 'ok',
         service: 'claude-code-vercel-proxy',
-        version: '2.0.3',
+        version: '2.0.4',
         timestamp: new Date().toISOString(),
       });
     }
