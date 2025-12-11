@@ -355,6 +355,7 @@ function buildResponse(
 
 /**
  * Handle streaming response
+ * Updated for AI SDK v5 fullStream event format
  */
 async function handleStreamingResponse(
   result: any,
@@ -395,8 +396,16 @@ async function handleStreamingResponse(
 
       try {
         for await (const event of result.fullStream) {
+          // AI SDK v5: Extract text content from different event formats
+          // The event structure may vary, so we check multiple possible properties
+          const getTextContent = (evt: any): string | undefined => {
+            // Try different property names used in AI SDK v5
+            return evt.text ?? evt.textDelta ?? evt.delta?.text ?? evt.delta?.textDelta;
+          };
+
           switch (event.type) {
-            case 'reasoning': {
+            case 'reasoning':
+            case 'reasoning-delta': {
               // Start thinking block if not started
               if (!thinkingStarted) {
                 sendEvent('content_block_start', {
@@ -408,17 +417,20 @@ async function handleStreamingResponse(
                 thinkingStarted = true;
               }
 
-              // Send thinking delta
-              sendEvent('content_block_delta', {
-                type: 'content_block_delta',
-                index: contentIndex,
-                delta: { type: 'thinking_delta', thinking: event.text },
-              });
+              // Get reasoning text - AI SDK v5 uses textDelta for reasoning events
+              const reasoningText = event.textDelta ?? event.text ?? '';
+              if (reasoningText) {
+                sendEvent('content_block_delta', {
+                  type: 'content_block_delta',
+                  index: contentIndex,
+                  delta: { type: 'thinking_delta', thinking: reasoningText },
+                });
+              }
               break;
             }
 
             case 'reasoning-signature': {
-              // Close thinking block with signature (signature is in providerMetadata)
+              // Close thinking block with signature
               if (thinkingStarted) {
                 sendEvent('content_block_stop', {
                   type: 'content_block_stop',
@@ -453,12 +465,15 @@ async function handleStreamingResponse(
                 textStarted = true;
               }
 
-              // Send text delta
-              sendEvent('content_block_delta', {
-                type: 'content_block_delta',
-                index: contentIndex,
-                delta: { type: 'text_delta', text: event.textDelta },
-              });
+              // AI SDK v5: text-delta uses 'textDelta' property
+              const textContent = event.textDelta ?? event.text ?? '';
+              if (textContent) {
+                sendEvent('content_block_delta', {
+                  type: 'content_block_delta',
+                  index: contentIndex,
+                  delta: { type: 'text_delta', text: textContent },
+                });
+              }
               break;
             }
 
@@ -724,7 +739,7 @@ export default {
       return jsonResponse({
         status: 'ok',
         service: 'claude-code-vercel-proxy',
-        version: '2.0.0',
+        version: '2.0.1',
         timestamp: new Date().toISOString(),
       });
     }
