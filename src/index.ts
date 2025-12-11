@@ -15,7 +15,7 @@
  */
 
 import { createGateway } from '@ai-sdk/gateway';
-import { streamText, generateText, jsonSchema, type CoreMessage, type CoreTool } from 'ai';
+import { streamText, generateText, type CoreMessage, type CoreTool } from 'ai';
 import type {
   Env,
   AnthropicRequest,
@@ -263,16 +263,19 @@ function normalizeInputSchema(inputSchema: any): any {
   }
 
   // Clone the schema to avoid mutation
-  const schema = { ...inputSchema };
+  const schema = JSON.parse(JSON.stringify(inputSchema));
 
-  // Ensure type is "object"
-  if (!schema.type) {
-    schema.type = 'object';
-  }
+  // Ensure type is "object" (must be exactly the string "object")
+  schema.type = 'object';
 
   // Ensure properties exists
   if (!schema.properties) {
     schema.properties = {};
+  }
+
+  // Ensure required is an array
+  if (!Array.isArray(schema.required)) {
+    schema.required = [];
   }
 
   return schema;
@@ -280,7 +283,7 @@ function normalizeInputSchema(inputSchema: any): any {
 
 /**
  * Convert Anthropic tools to AI SDK format
- * AI SDK v5 requires using jsonSchema() to wrap raw JSON schemas
+ * Uses Zod-compatible schema format for better compatibility with AI Gateway
  */
 function convertTools(
   tools: AnthropicTool[] | undefined
@@ -293,10 +296,16 @@ function convertTools(
     // Normalize the input schema to ensure it has type: "object"
     const normalizedSchema = normalizeInputSchema(tool.input_schema);
     
-    // AI SDK v5: Use jsonSchema() to wrap raw JSON schemas
+    // Create tool definition with JSON Schema directly
+    // AI SDK should handle the conversion internally
     const toolDef: any = {
       description: tool.description || '',
-      parameters: jsonSchema(normalizedSchema),
+      parameters: {
+        type: 'object',
+        properties: normalizedSchema.properties || {},
+        required: normalizedSchema.required || [],
+        additionalProperties: normalizedSchema.additionalProperties,
+      },
     };
 
     if (tool.cache_control) {
@@ -465,13 +474,6 @@ async function handleStreamingResponse(
 
       try {
         for await (const event of result.fullStream) {
-          // AI SDK v5: Extract text content from different event formats
-          // The event structure may vary, so we check multiple possible properties
-          const getTextContent = (evt: any): string | undefined => {
-            // Try different property names used in AI SDK v5
-            return evt.text ?? evt.textDelta ?? evt.delta?.text ?? evt.delta?.textDelta;
-          };
-
           switch (event.type) {
             case 'reasoning':
             case 'reasoning-delta': {
@@ -819,7 +821,7 @@ export default {
       return jsonResponse({
         status: 'ok',
         service: 'claude-code-vercel-proxy',
-        version: '2.0.4',
+        version: '2.0.5',
         timestamp: new Date().toISOString(),
       });
     }
